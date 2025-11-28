@@ -1,0 +1,6 @@
+option(
+  'compat',
+  type: 'boolean',
+  value: true,
+  description: 'dynamic modules compatibility',
+)
