@@ -1,122 +1,109 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+#include <onnxruntime_c_api.h>
 
-#define HELLO_WORLD "hello world\r\n"
+static const OrtApi *ort_api = NULL;
+static OrtEnv *ort_env = NULL;
+static OrtSession *ort_session = NULL;
 
 static char *ngx_http_ml_ddos(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_ml_ddos_init_process(ngx_cycle_t *cycle);
+static void ngx_http_ml_ddos_exit_process(ngx_cycle_t *cycle);
 
-/**
- * This module provided directive: hello world.
- *
- */
 static ngx_command_t ngx_http_ml_ddos_commands[] = {
 
-    {ngx_string("hello_world"),           /* directive */
-     NGX_HTTP_LOC_CONF | NGX_CONF_NOARGS, /* location context and takes
-                                             no arguments*/
-     ngx_http_ml_ddos,                    /* configuration setup function */
-     0, /* No offset. Only one context is supported. */
-     0, /* No offset when storing the module configuration on struct. */
+    {ngx_string("ngx_http_ml_ddos"),      // directive
+     NGX_HTTP_LOC_CONF | NGX_CONF_NOARGS, // location context
+     ngx_http_ml_ddos,                    // configuration setup function
+     0, // No offset. Only one context is supported.
+     0, // No offset when storing the module configuration on struct.
      NULL},
 
-    ngx_null_command /* command termination */
+    ngx_null_command // command termination
 };
 
-/* The hello world string. */
-static u_char ngx_hello_world[] = HELLO_WORLD;
+// No context for the module
+static ngx_http_module_t ngx_http_ml_ddos_module_ctx = {NULL};
 
-/* The module context. */
-static ngx_http_module_t ngx_http_ml_ddos_module_ctx = {
-    NULL, /* preconfiguration */
-    NULL, /* postconfiguration */
-
-    NULL, /* create main configuration */
-    NULL, /* init main configuration */
-
-    NULL, /* create server configuration */
-    NULL, /* merge server configuration */
-
-    NULL, /* create location configuration */
-    NULL  /* merge location configuration */
-};
-
-/* Module definition. */
 ngx_module_t ngx_http_ml_ddos_module = {
     NGX_MODULE_V1,
-    &ngx_http_ml_ddos_module_ctx, /* module context */
-    ngx_http_ml_ddos_commands,    /* module directives */
-    NGX_HTTP_MODULE,              /* module type */
-    NULL,                         /* init master */
-    NULL,                         /* init module */
-    NULL,                         /* init process */
-    NULL,                         /* init thread */
-    NULL,                         /* exit thread */
-    NULL,                         /* exit process */
-    NULL,                         /* exit master */
+    &ngx_http_ml_ddos_module_ctx,  // module context
+    ngx_http_ml_ddos_commands,     // module directives
+    NGX_HTTP_MODULE,               // module type
+    NULL,                          // init master
+    NULL,                          // init module
+    ngx_http_ml_ddos_init_process, // init process
+    NULL,                          // init thread
+    NULL,                          // exit thread
+    ngx_http_ml_ddos_exit_process, // exit process
+    NULL,                          // exit master
     NGX_MODULE_V1_PADDING};
 ngx_module_t *ngx_modules[] = {&ngx_http_ml_ddos_module, NULL};
 char *ngx_module_names[] = {"ngx_http_ml_ddos_module", NULL};
 char *ngx_module_order[] = {NULL};
 
-/**
- * Content handler.
- *
- * @param r
- *   Pointer to the request structure. See http_request.h.
- * @return
- *   The status of the response generation.
- */
 static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
-    ngx_buf_t *b;
-    ngx_chain_t out;
+#ifndef NDEBUG
+    ngx_str_t client_ip = r->connection->addr_text;
+    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
+                  "ML_DDOS Log: IP %V requested URI \"%V\"", &client_ip,
+                  &r->uri);
+#endif
 
-    /* Set the Content-Type header. */
-    r->headers_out.content_type.len = sizeof("text/plain") - 1;
-    r->headers_out.content_type.data = (u_char *)"text/plain";
+    return NGX_DECLINED;
+}
 
-    /* Allocate a new buffer for sending out the reply. */
-    b = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
+static ngx_int_t ngx_http_ml_ddos_init_process(ngx_cycle_t *cycle) {
+#define ASSERT_ORT(expr) \
+    if (expr)            \
+    goto error
 
-    /* Insertion in the buffer chain. */
-    out.buf = b;
-    out.next = NULL; /* just one buffer */
+    ort_api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
 
-    b->pos = ngx_hello_world; /* first position in memory of the data */
-    b->last = ngx_hello_world + sizeof(ngx_hello_world) -
-              1;     /* last position in memory of the data */
-    b->memory = 1;   /* content is in read-only memory */
-    b->last_buf = 1; /* there will be no more buffers in the request */
+    ASSERT_ORT(
+        ort_api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "ml_ddos_env", &ort_env));
 
-    /* Sending the headers for the reply. */
-    r->headers_out.status = NGX_HTTP_OK; /* 200 status code */
-    /* Get the content length of the body. */
-    r->headers_out.content_length_n = sizeof(ngx_hello_world) - 1;
-    ngx_http_send_header(r); /* Send the headers */
+    OrtSessionOptions *session_options;
+    ASSERT_ORT(ort_api->CreateSessionOptions(&session_options));
+    ASSERT_ORT(ort_api->SetIntraOpNumThreads(session_options, 1));
 
-    /* Send the body, and return the status code of the output filter chain. */
-    return ngx_http_output_filter(r, &out);
-} /* ngx_http_ml_ddos_handler */
+    const char *model_path = "/etc/nginx/model.onnx";
+    ASSERT_ORT(ort_api->CreateSession(ort_env, model_path, session_options,
+                                      &ort_session));
 
-/**
- * Configuration setup function that installs the content handler.
- *
- * @param cf
- *   Module configuration structure pointer.
- * @param cmd
- *   Module directives structure pointer.
- * @param conf
- *   Module configuration structure pointer.
- * @return string
- *   Status of the configuration setup.
- */
+    ort_api->ReleaseSessionOptions(session_options);
+
+    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                  "ML_DDOS: ONNX Session Initialized");
+    return NGX_OK;
+error:
+    ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                  "ML_DDOS: Failed to load ONNX model");
+    return NGX_ERROR;
+
+#undef ASSERT_ORT
+}
+
+static void ngx_http_ml_ddos_exit_process(ngx_cycle_t *cycle) {
+    if (ort_session)
+        ort_api->ReleaseSession(ort_session);
+    if (ort_env)
+        ort_api->ReleaseEnv(ort_env);
+}
+
 static char *ngx_http_ml_ddos(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
-    ngx_http_core_loc_conf_t *clcf; /* pointer to core location configuration */
 
-    /* Install the hello world handler. */
+    ngx_http_core_loc_conf_t *clcf;
+
     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
     clcf->handler = ngx_http_ml_ddos_handler;
 
+#ifndef NDEBUG
+    ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
+                       "ML_DDOS module is being initialized!");
+#endif
+
     return NGX_CONF_OK;
-} /* ngx_http_ml_ddos */
+}
