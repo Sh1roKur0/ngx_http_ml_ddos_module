@@ -13,7 +13,7 @@ meson setup build
 # Use --verbose if you need to debug the compilation process
 meson compile -C build
 
-# Install the module as modules/ngx_http_ddos_module.so to prefix
+# Install the module as modules/ngx_http_ml_ddos_module.so to prefix
 # /etc/nginx is the default prefix, use --prefix=/path/to/dir at setup to change
 sudo meson install -C build
 ```
@@ -23,10 +23,11 @@ You can pass these flags to `meson setup` to customize the build environment (fu
 
 | Flag | Values | Description |
 | --- | --- |--- |
+| -Dnginx_src | /path/to/dir | A directory where nginx's source code located (/usr/src/nginx by default) |
 | --buildtype | debug, release, plain | Overall build setup (e.g., debug includes symbols). |
-| -Doptimization | 0, 1, 2, 3, s, g | Code optimization level (s focuses on binary size). |
-| -Dprefix | /path/to/dir | Installation prefix for the compiled binaries. |
-| -Dwerror | true, false | If true, stops the build on any compiler warning. |
+| --optimization | 0, 1, 2, 3, s, g | Code optimization level (s focuses on binary size). |
+| --prefix | /path/to/dir | Installation prefix for the compiled binaries. |
+| --werror | true, false | If true, stops the build on any compiler warning. |
 
 ### Usage
 1. Load the Module: First, load the module at the top of your `nginx.conf`:

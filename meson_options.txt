@@ -1,0 +1,6 @@
+option(
+    'nginx_src',
+    type: 'string',
+    value: '/usr/src/nginx',
+    description: 'Path to the Nginx source directory',
+)

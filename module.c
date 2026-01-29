@@ -1,4 +1,3 @@
-#include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
 #include <onnxruntime_c_api.h>
@@ -65,8 +64,7 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
 #ifndef NDEBUG
     ngx_str_t client_ip = r->connection->addr_text;
     ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
-                  "ML_DDOS Log: IP %V requested URI \"%V\"", &client_ip,
-                  &r->uri);
+                  LOG_PREFIX "IP %V requested URI \"%V\"", &client_ip, &r->uri);
 #endif
 
     return NGX_DECLINED;
