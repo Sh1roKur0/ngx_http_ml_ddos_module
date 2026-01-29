@@ -24,6 +24,14 @@ ngx_bin = find_program(
     required: true,
 )
 
+if not fs.exists(get_option('nginx_src'))
+    error(
+        'Nginx\'s source code not found at @0@\nYou can change it by -Dnginx_src=...'.format(
+            get_option('nginx_src'),
+        ),
+    )
+endif
+
 cp_script = 'import shutil; shutil.copytree("@0@", "@1@", dirs_exist_ok=True)'
 run_command(
     py3,
