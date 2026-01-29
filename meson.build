@@ -19,7 +19,7 @@ deps = [
     dependency('nginx', required: true),
     dependency('onnxruntime', required: true),
 ]
-srcs = files('src/main.c')
+srcs = files('module.c')
 
 shared_library(
     meson.project_name(),
