@@ -1,6 +1,7 @@
 project(
     'ngx_http_ml_ddos_module',
     'c',
+    version: '0.1.1',
     default_options: [
         'c_std=c11',
         'b_lundef=false',
@@ -8,7 +9,10 @@ project(
         'b_ndebug=if-release',
         'buildtype=release',
         'warning_level=1',
+        'prefix=/etc/nginx/',
     ],
+    license: 'BSD-3-Clause',
+    license_files: 'LICENSE',
 )
 
 deps = [
@@ -22,4 +26,6 @@ shared_library(
     sources: srcs,
     dependencies: deps,
     install: true,
+    install_dir: 'modules',
+    name_prefix: '',
 )
