@@ -3,6 +3,19 @@
 #include <onnxruntime_c_api.h>
 
 #define LOG_PREFIX "ML_DDOS: "
+#ifndef NDEBUG
+#    define NGX_ASSERT(expr, log)                                           \
+        do {                                                                \
+            if (!(expr)) {                                                  \
+                ngx_log_error(NGX_LOG_EMERG, log, 0,                        \
+                              LOG_PREFIX "Assertion failed at %s:%d -- %s", \
+                              __FILE__, __LINE__, #expr);                   \
+                ngx_debug_point();                                          \
+            }                                                               \
+        } while (0)
+#else
+#    define NGX_ASSERT(...)
+#endif
 
 static const OrtApi *ort_api = NULL;
 static OrtEnv *ort_env = NULL;
@@ -110,6 +123,8 @@ error:
 }
 
 static void ngx_http_ml_ddos_exit_process(ngx_cycle_t *cycle) {
+    NGX_ASSERT(ort_session && ort_env, cycle->log);
+
     if (ort_session)
         ort_api->ReleaseSession(ort_session);
     if (ort_env)
@@ -120,9 +135,9 @@ static char *ngx_http_ml_ddos(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
     if (!(mlcf = conf))
         return NGX_CONF_ERROR;
     ngx_http_core_loc_conf_t *clcf;
-    ngx_str_t *value = cf->args->elts;
 
     if (cf->args->nelts == 2) {
+        ngx_str_t *value = cf->args->elts;
         mlcf->model_path = value[1];
     } else {
         ngx_str_set(&mlcf->model_path, "/etc/nginx/model.onnx");
@@ -132,7 +147,7 @@ static char *ngx_http_ml_ddos(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
     clcf->handler = ngx_http_ml_ddos_handler;
 
     ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
-                       LOG_PREFIX "module is being initialized!");
+                       LOG_PREFIX "Module is being initialized!");
 
     return NGX_CONF_OK;
 }

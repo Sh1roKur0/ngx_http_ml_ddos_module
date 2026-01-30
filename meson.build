@@ -50,12 +50,15 @@ if not fs.exists(ngx_src / 'objs')
     ngx_flags = run_command(ngx_bin, '-V', check: true).stderr().strip()
     configure_script = '''
 import subprocess, sys, os
-import subprocess, sys, os
 
 target_dir = sys.argv[1]
 raw_output = sys.argv[2]
 
-flags = [arg for arg in raw_output.split() if arg.startswith("--") and "module" not in arg and "opt" not in arg]
+flags = [
+    arg
+    for arg in raw_output.split()
+    if arg.startswith("--") and "module" not in arg and "opt" not in arg
+]
 
 os.chdir(target_dir)
 subprocess.run(["./configure"] + flags, check=True)
@@ -79,15 +82,14 @@ else
     ngx_includes += ngx_src_relative / 'src/os/unix'
 endif
 
-deps = [
-    dependency('onnxruntime', required: true),
-]
-srcs = files('module.c')
+if get_option('debug')
+    add_project_arguments('-DNGX_DEBUG=1', language: 'c')
+endif
 
 shared_library(
     meson.project_name(),
-    sources: srcs,
-    dependencies: deps,
+    files('module.c'),
+    dependencies: dependency('onnxruntime', required: true),
     include_directories: ngx_includes,
     install: true,
     install_dir: 'modules',
