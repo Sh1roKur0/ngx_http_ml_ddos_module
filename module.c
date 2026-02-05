@@ -39,7 +39,7 @@ static ngx_command_t ngx_http_ml_ddos_commands[] = {
      NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1 | NGX_CONF_NOARGS, // location context
      ngx_http_ml_ddos_directive, // configuration setup function
      NGX_HTTP_LOC_CONF_OFFSET,   // local offset
-     offsetof(ngx_http_ml_ddos_loc_conf_t, session), // configuration offset
+     0,                          // configuration offset
      NULL},
 
     ngx_null_command};
@@ -75,6 +75,7 @@ char *ngx_module_order[] = {NULL};
 static void ngx_http_ml_ddos_cleanup_main_conf(void *data) {
     ngx_http_ml_ddos_main_conf_t *mcf = data;
     mcf->api->ReleaseEnv(mcf->env);
+    mcf->env = NULL;
 }
 
 static void *ngx_http_ml_ddos_create_main_conf(ngx_conf_t *cf) {
@@ -83,7 +84,8 @@ static void *ngx_http_ml_ddos_create_main_conf(ngx_conf_t *cf) {
     if (!mcf)
         return NULL;
 
-    mcf->api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+    if (!(mcf->api = OrtGetApiBase()->GetApi(ORT_API_VERSION)))
+        return NULL;
     if (mcf->api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "ml_ddos_env",
                             &mcf->env))
         return NULL;
@@ -98,13 +100,17 @@ static void *ngx_http_ml_ddos_create_main_conf(ngx_conf_t *cf) {
     return mcf;
 }
 
-static void ngx_http_ml_ddos_cleanup_loc_conf(void *data) {
-    ngx_http_ml_ddos_loc_conf_t *lcf = data;
-    ngx_http_ml_ddos_main_conf_t *mcf =
-        (void *)((size_t)data + sizeof(ngx_http_ml_ddos_loc_conf_t *));
+typedef struct {
+    ngx_http_ml_ddos_loc_conf_t *lcf;
+    ngx_http_ml_ddos_main_conf_t *mcf;
+} ngx_http_ml_ddos_cleanup_ctx_t;
 
-    if (lcf && mcf && lcf->session) {
-        mcf->api->ReleaseSession(lcf->session);
+static void ngx_http_ml_ddos_cleanup_loc_conf(void *data) {
+    ngx_http_ml_ddos_cleanup_ctx_t *ctx = data;
+
+    if (ctx->lcf && ctx->mcf && ctx->lcf->session) {
+        ctx->mcf->api->ReleaseSession(ctx->lcf->session);
+        ctx->lcf->session = NULL;
     }
 }
 
@@ -119,17 +125,14 @@ static void *ngx_http_ml_ddos_create_loc_conf(ngx_conf_t *cf) {
     if (!mcf)
         return NULL;
 
-    ngx_pool_cleanup_t *cln = ngx_pool_cleanup_add(
-        cf->pool, sizeof(ngx_http_ml_ddos_loc_conf_t *) +
-                      sizeof(ngx_http_ml_ddos_main_conf_t *));
+    ngx_pool_cleanup_t *cln =
+        ngx_pool_cleanup_add(cf->pool, sizeof(ngx_http_ml_ddos_cleanup_ctx_t));
     if (!cln)
         return NULL;
 
     cln->handler = ngx_http_ml_ddos_cleanup_loc_conf;
-    ngx_memcpy(cln->data, &lcf, sizeof(ngx_http_ml_ddos_loc_conf_t *));
-    ngx_memcpy(
-        (void *)((size_t)cln->data + sizeof(ngx_http_ml_ddos_loc_conf_t *)),
-        &mcf, sizeof(ngx_http_ml_ddos_main_conf_t *));
+    const ngx_http_ml_ddos_cleanup_ctx_t ctx = {lcf, mcf};
+    ngx_memcpy(cln->data, &ctx, sizeof(ctx));
 
     return lcf;
 }
@@ -143,6 +146,9 @@ static char *ngx_http_ml_ddos_directive(ngx_conf_t *cf, ngx_command_t *cmd,
     NGX_ASSERT(mcf && mcf->api && mcf->env, cf->log);
 
     ngx_http_ml_ddos_loc_conf_t *lcf = conf;
+    if (lcf->session)
+        return "ngx_http_ml_ddos is already defined for this location";
+
     const char *model_path = "/etc/nginx/model.onnx";
     if (cf->args->nelts == 2) {
         ngx_str_t path = ((ngx_str_t *)cf->args->elts)[1];
@@ -151,6 +157,10 @@ static char *ngx_http_ml_ddos_directive(ngx_conf_t *cf, ngx_command_t *cmd,
             return NGX_CONF_ERROR;
         ngx_cpystrn((u_char *)model_path, path.data, path.len + 1);
     }
+
+    ngx_file_info_t fi;
+    if (ngx_file_info(model_path, &fi) != NGX_OK)
+        return "Model file not found";
 
     OrtStatusPtr status;
 #define CHECK_ORT(expr, err) \
@@ -162,6 +172,9 @@ static char *ngx_http_ml_ddos_directive(ngx_conf_t *cf, ngx_command_t *cmd,
     OrtSessionOptions *session_options;
     CHECK_ORT(mcf->api->CreateSessionOptions(&session_options), opt_err);
     CHECK_ORT(mcf->api->SetIntraOpNumThreads(session_options, 1), session_err);
+    CHECK_ORT(
+        mcf->api->SetSessionExecutionMode(session_options, ORT_SEQUENTIAL),
+        session_err);
     CHECK_ORT(mcf->api->CreateSession(mcf->env, model_path, session_options,
                                       &lcf->session),
               session_err);
@@ -196,7 +209,7 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
     NGX_ASSERT(lcf && lcf->session, r->connection->log);
 
     ngx_str_t client_ip = r->connection->addr_text;
-    ngx_log_debug(NGX_LOG_NOTICE, r->connection->log, NGX_OK,
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, NGX_OK,
                   LOG_PREFIX "IP %V requested URI \"%V\"", &client_ip, &r->uri);
 
     return NGX_DECLINED;
