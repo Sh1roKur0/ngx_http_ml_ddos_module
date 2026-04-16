@@ -1,4 +1,3 @@
-#include "ngx_conf_file.h"
 #include <ngx_core.h>
 #include <ngx_http.h>
 #include <onnxruntime_c_api.h>
