@@ -1,4 +1,5 @@
 stages:
+  - prepare
   - build
   - test
 
@@ -15,14 +16,30 @@ variables:
     - echo "deb http://mirror.selectel.ru/debian bookworm-updates main contrib non-free non-free-firmware" >> /etc/apt/sources.list
     - apt-get update
 
+prepare:
+  stage: prepare
+  before_script:
+    - !reference [.apt_setup, before_script]
+    - apt-get install -y curl ca-certificates
+
+  script:
+    - curl -L -o onnxruntime.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.17.3/onnxruntime-linux-x64-1.17.3.tgz
+    - tar -xzf onnxruntime.tgz
+
+  artifacts:
+    paths:
+      - onnxruntime-linux-x64-1.17.3/lib/
+      - onnxruntime-linux-x64-1.17.3/include/
+
 build:
   stage: build
+  dependencies:
+    - prepare
   before_script:
     - !reference [.apt_setup, before_script]
     - |
       apt-get install -y \
         build-essential \
-        clang \
         pkg-config \
         curl \
         git \
@@ -32,11 +49,8 @@ build:
         libssl-dev
 
     # ONNX Runtime
-    - curl -L -o onnxruntime.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.17.3/onnxruntime-linux-x64-1.17.3.tgz
-    - tar -xzf onnxruntime.tgz
     - cp -r onnxruntime-linux-x64-1.17.3/include/* /usr/local/include/
     - cp -r onnxruntime-linux-x64-1.17.3/lib/* /usr/local/lib/
-    - ln -sf /usr/local/lib/libonnxruntime.so /usr/local/lib/libonnxruntime.so.1
     - ldconfig
 
     - mkdir -p /usr/local/lib/pkgconfig
@@ -65,50 +79,59 @@ build:
   script:
     - cd nginx
     - ./configure --add-dynamic-module=.. --with-ld-opt="-Wl,-rpath,/usr/local/lib"
+    - make -j$(nproc)
     - make modules
 
   artifacts:
     paths:
+      - nginx/objs/nginx
       - nginx/objs/*.so
 
 test:
   stage: test
   dependencies:
+    - prepare
     - build
   before_script:
     - !reference [.apt_setup, before_script]
-    - apt-get install -y nginx curl ca-certificates
+    - apt-get install -y curl ca-certificates
+
+    - cp -r onnxruntime-linux-x64-1.17.3/lib/* /usr/local/lib/
+    - export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+    - ldconfig
 
     - mkdir -p /tmp/nginx-modules
     - cp nginx/objs/ngx_http_ml_ddos_module.so /tmp/nginx-modules/
 
+    - mkdir -p /tmp/nginx
+    - mkdir -p /tmp/nginx/{logs,client_body_temp,proxy_temp,fastcgi_temp,uwsgi_temp,scgi_temp}
     - |
-      cat > /etc/nginx/nginx.conf <<EOF
+      cat > /tmp/nginx/nginx.conf <<EOF
       load_module /tmp/nginx-modules/ngx_http_ml_ddos_module.so;
 
       events {}
+
+      error_log /tmp/nginx/logs/error.log info;
 
       http {
           server {
               listen 8080;
 
               location /test {
-                  ngx_http_ml_ddos /etc/nginx/model.onnx;
+                  ngx_http_ml_ddos;
                   return 200 "OK\n";
               }
           }
       }
       EOF
 
-    - echo "dummy" > /etc/nginx/model.onnx
-    - export LD_LIBRARY_PATH=/usr/local/lib:$
-    - ls /usr/local/lib
-    - ldconfig
+    - curl -L -o /tmp/nginx/model.onnx https://github.com/onnx/models/raw/main/validated/vision/classification/squeezenet/model/squeezenet1.0-3.onnx
   script:
-    - nginx
+    - ./nginx/objs/nginx -v
+    - ./nginx/objs/nginx -t -p /tmp/nginx/ -c /tmp/nginx/nginx.conf
+    - ./nginx/objs/nginx -p /tmp/nginx/ -c /tmp/nginx/nginx.conf -g "daemon off;" &
 
-    - sleep 1
+    - tail -f /tmp/nginx/logs/error.log | grep -m 1 "start worker processes" && exit 0
     - curl -i http://127.0.0.1:8080/test
 
-    - nginx -t
-    - nginx -s stop
+    - ./nginx/objs/nginx -s stop -p /tmp/nginx -c /tmp/nginx/nginx.conf

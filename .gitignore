@@ -1,6 +1,7 @@
 .idea
 .vscode
 .cache
+.gitlab-ci-local
 tasks.json
 
 build
