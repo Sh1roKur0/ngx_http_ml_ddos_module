@@ -51,25 +51,6 @@ build:
     - cp -r onnxruntime-linux-x64-${ONNX_VERSION}/lib/* /usr/local/lib/
     - ldconfig
 
-    - mkdir -p /usr/local/lib/pkgconfig
-    - |
-      cat > /usr/local/lib/pkgconfig/libonnxruntime.pc <<EOF
-      prefix=/usr/local
-      exec_prefix=\${prefix}
-      libdir=\${prefix}/lib
-      includedir=\${prefix}/include
-
-      Name: onnxruntime
-      Description: ONNX Runtime C API
-      Version: ${ONNX_VERSION}
-      Libs: -L\${libdir} -lonnxruntime
-      Cflags: -I\${includedir}
-      EOF
-
-    - export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
-    - pkg-config --cflags libonnxruntime
-    - pkg-config --libs libonnxruntime
-
     - |
       export NGINX_VERSION=$(apt-cache show nginx \
         | grep -m1 '^Version:' \
@@ -80,7 +61,11 @@ build:
 
   script:
     - cd nginx
-    - ./configure --add-dynamic-module=.. --with-ld-opt="-Wl,-rpath,/usr/local/lib" --with-compat
+    - |
+      ./configure \
+      --add-dynamic-module=.. \
+      --with-ld-opt="-Wl,-rpath,/usr/local/lib" \
+      --with-compat
     - make modules
 
   artifacts:
@@ -136,9 +121,13 @@ test:
   script:
     - nginx -v
     - nginx -t 
-    - nginx -g "daemon off;" &
+    - nginx
 
-    - tail -f /etc/nginx/logs/error.log | grep -m 1 "start worker processes" && exit 0
+    - |
+      for i in $(seq 1 20); do
+        curl -s http://127.0.0.1:8080/test && break
+        sleep 1
+      done
     - curl -i http://127.0.0.1:8080/test
 
     - nginx -s stop
