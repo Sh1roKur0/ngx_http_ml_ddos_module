@@ -6,6 +6,5 @@ tasks.json
 build
 builddir
 .env
-subprojects/*
-!subprojects/*.wrap
-!subprojects/packagefiles
+
+nginx*

@@ -1,0 +1,13 @@
+ngx_addon_name=ngx_http_ml_ddos_module
+
+ngx_module_type=HTTP
+ngx_module_name=ngx_http_ml_ddos_module
+ngx_module_srcs="$ngx_addon_dir/ngx_http_ml_ddos_module.c"
+
+ORT_INC_DIR="$(pkg-config --cflags-only-I libonnxruntime | sed 's/-I//g')"
+ORT_LIBS="$(pkg-config --libs libonnxruntime)"
+
+ngx_module_incs="$ORT_INC_DIR"
+ngx_module_libs="$ORT_LIBS"
+
+. auto/module

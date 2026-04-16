@@ -1,0 +1,9 @@
+CompileFlags:
+  Add:
+    - -I./nginx/src/core
+    - -I./nginx/src/event
+    - -I./nginx/src/os/unix
+    - -I./nginx/src/http
+    - -I./nginx/src/http/modules
+    - -I./nginx/objs
+    - -I/usr/include/onnxruntime
