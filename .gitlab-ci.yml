@@ -113,7 +113,7 @@ test:
               listen 8080;
 
               location /test {
-                  ngx_http_ml_ddos;
+                  ngx_http_ml_ddos /etc/nginx/model.onnx;
                   return 200 "OK\n";
               }
           }
