@@ -80,7 +80,7 @@ test:
     - *global_cache
     - key: model
       paths:
-        - model.onnx
+        - model.onnx.tar.gz
   before_script:
     - !reference [.apt_setup, before_script]
     - apt-get install -y curl ca-certificates nginx
@@ -90,11 +90,12 @@ test:
     - ldconfig
 
     - |
-      if [ ! -f model.onnx ]; then
-        curl -L -o model.onnx \
-        https://github.com/onnx/models/raw/main/validated/vision/classification/squeezenet/model/squeezenet1.0-3.onnx
-      fi
-    - cp model.onnx /etc/nginx/model.onnx
+      if [ ! -f model.onnx.tar.gz ]; then
+        curl -L -o model.onnx.tar.gz \
+        https://github.com/Sh1roKur0/ngx_http_ml_ddos_module/releases/download/Release/model.onnx.tar.gz
+        fi
+    - tar xf model.onnx.tar.gz
+    - mv model.onnx /etc/nginx/model.onnx
 
     - mkdir -p /tmp/nginx-modules
     - cp nginx/objs/ngx_http_ml_ddos_module.so /tmp/nginx-modules/
@@ -109,11 +110,12 @@ test:
       error_log /etc/nginx/logs/error.log info;
 
       http {
+          ml_ddos_path /etc/nginx/model.onnx;
           server {
               listen 8080;
 
               location /test {
-                  ngx_http_ml_ddos /etc/nginx/model.onnx;
+                  ml_ddos on;
                   return 200 "OK\n";
               }
           }
