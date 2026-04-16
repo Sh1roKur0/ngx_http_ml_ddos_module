@@ -7,6 +7,7 @@ image: debian:12-slim
 
 variables:
   NGINX_VERSION: "1.30.0"
+  ONNX_VERSION: "1.17.3"
 
 .apt_setup:
   before_script:
@@ -16,6 +17,12 @@ variables:
     - echo "deb http://mirror.selectel.ru/debian bookworm-updates main contrib non-free non-free-firmware" >> /etc/apt/sources.list
     - apt-get update
 
+cache:
+  key: onnxruntime-${ONNX_VERSION}
+  paths:
+    - onnxruntime.tgz
+    - onnxruntime-linux-x64-${ONNX_VERSION}/
+
 prepare:
   stage: prepare
   before_script:
@@ -23,13 +30,16 @@ prepare:
     - apt-get install -y curl ca-certificates
 
   script:
-    - curl -L -o onnxruntime.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.17.3/onnxruntime-linux-x64-1.17.3.tgz
-    - tar -xzf onnxruntime.tgz
+    - |
+      if [ ! -f onnxruntime.tgz ]; then
+        curl -L -o onnxruntime.tgz \
+          https://github.com/microsoft/onnxruntime/releases/download/v${ONNX_VERSION}/onnxruntime-linux-x64-${ONNX_VERSION}.tgz
+      fi
 
-  artifacts:
-    paths:
-      - onnxruntime-linux-x64-1.17.3/lib/
-      - onnxruntime-linux-x64-1.17.3/include/
+    - |
+      if [ ! -d onnxruntime-linux-x64-${ONNX_VERSION} ]; then
+        tar -xzf onnxruntime.tgz
+      fi
 
 build:
   stage: build
@@ -49,8 +59,8 @@ build:
         libssl-dev
 
     # ONNX Runtime
-    - cp -r onnxruntime-linux-x64-1.17.3/include/* /usr/local/include/
-    - cp -r onnxruntime-linux-x64-1.17.3/lib/* /usr/local/lib/
+    - cp -r onnxruntime-linux-x64-${ONNX_VERSION}/include/* /usr/local/include/
+    - cp -r onnxruntime-linux-x64-${ONNX_VERSION}/lib/* /usr/local/lib/
     - ldconfig
 
     - mkdir -p /usr/local/lib/pkgconfig
@@ -63,7 +73,7 @@ build:
 
       Name: onnxruntime
       Description: ONNX Runtime C API
-      Version: 1.17.3
+      Version: ${ONNX_VERSION}
       Libs: -L\${libdir} -lonnxruntime
       Cflags: -I\${includedir}
       EOF
@@ -96,7 +106,7 @@ test:
     - !reference [.apt_setup, before_script]
     - apt-get install -y curl ca-certificates
 
-    - cp -r onnxruntime-linux-x64-1.17.3/lib/* /usr/local/lib/
+    - cp -r onnxruntime-linux-x64-${ONNX_VERSION}/lib/* /usr/local/lib/
     - export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
     - ldconfig
 
