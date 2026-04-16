@@ -68,9 +68,6 @@ ngx_module_t ngx_http_ml_ddos_module = {
     NULL,                         // exit process
     NULL,                         // exit master
     NGX_MODULE_V1_PADDING};
-ngx_module_t *ngx_modules[] = {&ngx_http_ml_ddos_module, NULL};
-char *ngx_module_names[] = {"ngx_http_ml_ddos_module", NULL};
-char *ngx_module_order[] = {NULL};
 
 static void ngx_http_ml_ddos_cleanup_main_conf(void *data) {
     ngx_http_ml_ddos_main_conf_t *mcf = data;
