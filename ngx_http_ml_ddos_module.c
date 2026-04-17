@@ -109,19 +109,7 @@ static char *ngx_http_ml_ddos_merge_loc_conf(ngx_conf_t *cf, void *parent,
 
 /// ===== PROCESS ======
 
-static u_char *ngx_http_ml_ddos_strdup(ngx_pool_t *pool, ngx_str_t *src) {
-    u_char *dst = ngx_pnalloc(pool, src->len + 1);
-    if (!dst)
-        return NULL;
-
-    ngx_memcpy(dst, src->data, src->len);
-    dst[src->len] = '\0';
-
-    return dst;
-}
-
 static ngx_int_t ngx_http_ml_ddos_init_process(ngx_cycle_t *cycle) {
-
     ngx_http_ml_ddos_main_conf_t *mcf =
         ngx_http_cycle_get_module_main_conf(cycle, ngx_http_ml_ddos_module);
     if (mcf == NULL || mcf->model_path.len == 0) {
@@ -130,8 +118,7 @@ static ngx_int_t ngx_http_ml_ddos_init_process(ngx_cycle_t *cycle) {
         return NGX_ERROR;
     }
 
-    u_char *model_path_cstr =
-        ngx_http_ml_ddos_strdup(cycle->pool, &mcf->model_path);
+    u_char *model_path_cstr = ngx_pstrdup(cycle->pool, &mcf->model_path);
     ngx_file_info_t fi;
     if (!model_path_cstr ||
         ngx_file_info((const char *)model_path_cstr, &fi) == NGX_FILE_ERROR) {
@@ -249,6 +236,16 @@ static char *ngx_http_ml_ddos_enable(ngx_conf_t *cf, ngx_command_t *cmd,
 /// ===== HANDLER =====
 
 static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
+#if NGX_DEBUG
+    ngx_table_elt_t *h = ngx_list_push(&r->headers_out.headers);
+    if (!h)
+        return NGX_ERROR;
+
+    ngx_str_set(&h->key, "X-HTTP-ML");
+    ngx_str_set(&h->value, "Enabled");
+    h->hash = 1;
+#endif
+
     ngx_http_ml_ddos_loc_conf_t *lcf =
         ngx_http_get_module_loc_conf(r, ngx_http_ml_ddos_module);
     if (!lcf->enabled)
