@@ -197,7 +197,7 @@ static ngx_int_t ngx_http_ml_ddos_init(ngx_conf_t *cf) {
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
 
-    h = ngx_array_push(&cmcf->phases[NGX_HTTP_ACCESS_PHASE].handlers);
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_REWRITE_PHASE].handlers);
     if (h == NULL) {
         return NGX_ERROR;
     }
@@ -236,20 +236,20 @@ static char *ngx_http_ml_ddos_enable(ngx_conf_t *cf, ngx_command_t *cmd,
 /// ===== HANDLER =====
 
 static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
+    ngx_http_ml_ddos_loc_conf_t *lcf =
+        ngx_http_get_module_loc_conf(r, ngx_http_ml_ddos_module);
+    if (!lcf->enabled)
+        return NGX_DECLINED;
+
 #if NGX_DEBUG
     ngx_table_elt_t *h = ngx_list_push(&r->headers_out.headers);
     if (!h)
         return NGX_ERROR;
 
-    ngx_str_set(&h->key, "X-HTTP-ML");
+    ngx_str_set(&h->key, "X-HTTP-ML-DDOS");
     ngx_str_set(&h->value, "Enabled");
     h->hash = 1;
 #endif
-
-    ngx_http_ml_ddos_loc_conf_t *lcf =
-        ngx_http_get_module_loc_conf(r, ngx_http_ml_ddos_module);
-    if (!lcf->enabled)
-        return NGX_DECLINED;
 
     NGX_ASSERT(ort_api && ort_session, r->connection->log);
 
