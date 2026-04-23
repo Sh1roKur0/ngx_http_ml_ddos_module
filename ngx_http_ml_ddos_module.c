@@ -2,6 +2,8 @@
 #include <ngx_http.h>
 #include <onnxruntime_c_api.h>
 
+#include <ctype.h>
+
 #define LOG_PREFIX "ML_DDOS: "
 #if NGX_DEBUG
 #    define NGX_ASSERT(expr, log)                                           \
@@ -29,6 +31,8 @@ static const OrtApi *ort_api = NULL;
 static OrtEnv *ort_env = NULL;
 static OrtSessionOptions *ort_session_options = NULL;
 static OrtSession *ort_session = NULL;
+static OrtAllocator *ort_allocator = NULL;
+static OrtMemoryInfo *ort_memory_info = NULL;
 
 static void *ngx_http_ml_ddos_create_main_conf(ngx_conf_t *cf);
 static void *ngx_http_ml_ddos_create_loc_conf(ngx_conf_t *cf);
@@ -135,42 +139,56 @@ static ngx_int_t ngx_http_ml_ddos_init_process(ngx_cycle_t *cycle) {
 
     OrtStatus *status;
     if ((status = ort_api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "ngx_ml_ddos",
-                                     &ort_env))) {
-        ngx_log_error(NGX_LOG_ERR, cycle->log, NGX_ERROR,
-                      LOG_PREFIX "CreateEnv failed: %s",
-                      ort_api->GetErrorMessage(status));
+                                     &ort_env)))
         goto error_env;
-    }
-    if ((status = ort_api->CreateSessionOptions(&ort_session_options))) {
-        ngx_log_error(NGX_LOG_ERR, cycle->log, NGX_ERROR,
-                      LOG_PREFIX "CrateSessionOptions failed: %s",
-                      ort_api->GetErrorMessage(status));
+    if ((status = ort_api->CreateSessionOptions(&ort_session_options)))
         goto error_options;
-    }
     if ((status = ort_api->CreateSession(ort_env, (const char *)model_path_cstr,
-                                         ort_session_options, &ort_session))) {
-        ngx_log_error(NGX_LOG_ERR, cycle->log, NGX_ERROR,
-                      LOG_PREFIX "CreateSession failed: %s",
-                      ort_api->GetErrorMessage(status));
+                                         ort_session_options, &ort_session)))
         goto error_session;
-    }
+    if ((status = ort_api->GetAllocatorWithDefaultOptions(&ort_allocator)))
+        goto error_allocator;
+    if ((status = ort_api->CreateCpuMemoryInfo(
+             OrtArenaAllocator, OrtMemTypeDefault, &ort_memory_info)))
+        goto error_memory;
 
     ngx_log_error(NGX_LOG_NOTICE, cycle->log, NGX_OK,
                   LOG_PREFIX "initialized with model: %V", &mcf->model_path);
 
     return NGX_OK;
 
+error_memory:
+    ort_api->ReleaseAllocator(ort_allocator);
+error_allocator:
+    ort_api->ReleaseSession(ort_session);
 error_session:
     ort_api->ReleaseSessionOptions(ort_session_options);
 error_options:
     ort_api->ReleaseEnv(ort_env);
 error_env:
     ort_api->ReleaseStatus(status);
+
+    ngx_log_error(NGX_LOG_ERR, cycle->log, NGX_ERROR,
+                  LOG_PREFIX "ONNX initialize failed: %s",
+                  ort_api->GetErrorMessage(status));
+    ort_api->ReleaseStatus(status);
     return NGX_ERROR;
 }
 
 static void ngx_http_ml_ddos_exit_process(ngx_cycle_t *cycle) {
-    NGX_ASSERT(ort_session && ort_session_options && ort_env, cycle->log);
+    NGX_ASSERT(ort_session && ort_session_options && ort_env && ort_allocator &&
+                   ort_memory_info,
+               cycle->log);
+
+    if (ort_allocator) {
+        ort_api->ReleaseAllocator(ort_allocator);
+        ort_allocator = NULL;
+    }
+
+    if (ort_memory_info) {
+        ort_api->ReleaseMemoryInfo(ort_memory_info);
+        ort_memory_info = NULL;
+    }
 
     if (ort_session) {
         ort_api->ReleaseSession(ort_session);
@@ -250,11 +268,114 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
     ngx_str_set(&h->key, "X-HTTP-ML-DDOS");
     ngx_str_set(&h->value, "Enabled");
     h->hash = 1;
-
-    ngx_str_t client_ip = r->connection->addr_text;
-    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, NGX_OK,
-                  LOG_PREFIX "IP %V requested URI \"%V\"", &client_ip, &r->uri);
 #endif
 
-    return NGX_DECLINED;
+    float intensity = (float)r->connection->requests;
+    float request_length = (float)r->request_length;
+    float url_length = (float)r->request_line.len;
+    float args_length = (float)r->args.len + !!r->args.len;
+    float ua_length = r->headers_in.user_agent
+                          ? (float)r->headers_in.user_agent->value.len
+                          : 0.0f;
+
+    ngx_time_t *tp = ngx_timeofday();
+    ngx_msec_t ms =
+        (tp->sec - r->start_sec) * 1000 + (tp->msec - r->start_msec);
+    float request_time = ms > 0 ? (float)ms / 1000.0f : 0.0f;
+
+    float special_chars = 0.0f;
+    for (size_t i = 0; i < r->args.len; i++)
+        if (!isalnum((unsigned char)r->args.data[i]))
+            special_chars++;
+
+#if NGX_DEBUG
+    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, NGX_OK,
+                  LOG_PREFIX "PARAMS:\n"
+                             "\tintensivity: %f\n"
+                             "\trequest_length: %f\n"
+                             "\trequest_time: %.6f\n"
+                             "\turl_length: %f\n"
+                             "\targs_length: %f\n"
+                             "\tspecial_chars: %f\n"
+                             "\tua_length: %f\n",
+                  intensity, request_length, request_time, url_length,
+                  args_length, special_chars, ua_length);
+#endif
+
+    float features[7] = {intensity,   request_length, request_time, url_length,
+                         args_length, special_chars,  ua_length};
+
+    ngx_int_t rc = NGX_DECLINED;
+    OrtStatus *status = NULL;
+#define ONNX_ASSERT(expr)      \
+    do {                       \
+        if ((status = (expr))) \
+            goto onnx_error;   \
+    } while (0)
+
+    int64_t dims[2] = {1, 7};
+    OrtValue *input_tensor = NULL;
+    ONNX_ASSERT(ort_api->CreateTensorWithDataAsOrtValue(
+        ort_memory_info, features, sizeof(features), dims, 2,
+        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor));
+
+    const char *input_names[] = {"features"};
+    const char *output_names[] = {"label", "probabilities"};
+
+    OrtValue *outputs[2] = {NULL, NULL};
+    ONNX_ASSERT(ort_api->Run(ort_session, NULL, input_names,
+                             (const OrtValue *const *)&input_tensor, 1,
+                             output_names, 2, outputs));
+
+    ONNXType out_type;
+    ONNX_ASSERT(ort_api->GetValueType(outputs[1], &out_type));
+
+    if (out_type != ONNX_TYPE_SEQUENCE)
+        goto onnx_error;
+
+    size_t seq_len = 0;
+    ONNX_ASSERT(ort_api->GetValueCount(outputs[1], &seq_len));
+    if (seq_len == 0)
+        goto onnx_error;
+
+    OrtValue *seq_elem = NULL;
+    ONNX_ASSERT(ort_api->GetValue(outputs[1], 0, ort_allocator, &seq_elem));
+
+    int64_t key = 1;
+    OrtValue *tensor = NULL;
+    ONNX_ASSERT(ort_api->GetValue(seq_elem, key, ort_allocator, &tensor));
+
+    float *probs = NULL;
+    ONNX_ASSERT(ort_api->GetTensorMutableData(tensor, (void **)&probs));
+
+    float attack_prob = probs[1];
+
+#if NGX_DEBUG
+    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, NGX_OK,
+                  LOG_PREFIX "DDOS probability: %.6f", attack_prob);
+#endif
+
+    if (attack_prob > 0.85)
+        rc = NGX_HTTP_FORBIDDEN;
+    else if (attack_prob > 0.65)
+        rc = NGX_HTTP_TOO_MANY_REQUESTS;
+
+    goto cleanup;
+
+onnx_error:
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, NGX_ERROR,
+                  LOG_PREFIX "ONNX error: %s",
+                  ort_api->GetErrorMessage(status));
+    ort_api->ReleaseStatus(status);
+    rc = NGX_ERROR;
+
+cleanup:
+    if (input_tensor)
+        ort_api->ReleaseValue(input_tensor);
+    if (outputs[0])
+        ort_api->ReleaseValue(outputs[0]);
+    if (outputs[1])
+        ort_api->ReleaseValue(outputs[1]);
+
+    return rc;
 }
