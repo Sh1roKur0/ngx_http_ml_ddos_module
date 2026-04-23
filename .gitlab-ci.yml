@@ -16,7 +16,7 @@ variables:
     - apt-get update
 
 default:
-  cache: &global_cache
+  cache:
     - key: onnxruntime-${ONNX_VERSION}
       paths:
         - onnxruntime.tgz
@@ -65,7 +65,8 @@ build:
       ./configure \
       --add-dynamic-module=.. \
       --with-ld-opt="-Wl,-rpath,/usr/local/lib" \
-      --with-compat
+      --with-compat \
+      --with-debug
     - make modules
 
   artifacts:
@@ -76,24 +77,18 @@ test:
   stage: test
   dependencies:
     - build
-  cache:
-    - *global_cache
-    - key: model
-      paths:
-        - model.onnx
   before_script:
     - !reference [.apt_setup, before_script]
-    - apt-get install -y curl ca-certificates nginx
+    - apt-get install -y curl ca-certificates nginx locales
+
+    - locale-gen en_US.UTF-8
+    - export LANG=en_US.utf8
+    - export LC_ALL=en_US.utf8
 
     - cp -r onnxruntime-linux-x64-${ONNX_VERSION}/lib/* /usr/local/lib/
     - export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
     - ldconfig
 
-    - |
-      if [ ! -f model.onnx ]; then
-        curl -L -o model.onnx \
-        https://github.com/onnx/models/raw/main/validated/vision/classification/squeezenet/model/squeezenet1.0-3.onnx
-      fi
     - cp model.onnx /etc/nginx/model.onnx
 
     - mkdir -p /tmp/nginx-modules
@@ -109,12 +104,25 @@ test:
       error_log /etc/nginx/logs/error.log info;
 
       http {
+          ml_ddos_path /etc/nginx/model.onnx;
           server {
               listen 8080;
 
-              location /test {
-                  ngx_http_ml_ddos;
-                  return 200 "OK\n";
+              location /ml {
+                  ml_ddos on;
+                  default_type text/plain;
+                  return 200 "ML\n";
+              }
+
+              location /no_ml {
+                  ml_ddos off;
+                  default_type text/plain;
+                  return 200 "NO_ML\n";
+              }
+
+              location /default {
+                  default_type text/plain;
+                  return 200 "Default\n";
               }
           }
       }
@@ -126,9 +134,27 @@ test:
 
     - |
       for i in $(seq 1 20); do
-        curl -s http://127.0.0.1:8080/test && break
+        curl -s http://127.0.0.1:8080/default && break
         sleep 1
       done
-    - curl -i http://127.0.0.1:8080/test
+
+    - >
+      curl -s -D - http://127.0.0.1:80/ml -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled" && echo "PASS: ml"
+
+    - |
+      if curl -s -D - http://127.0.0.1:80/no_ml -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled"; then
+        echo "FAIL: header should not exist"
+        exit 1
+      else
+        echo "PASS: no_ml"
+      fi
+
+    - |
+      if curl -s -D - http://127.0.0.1:80/default -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled"; then
+        echo "FAIL: ml_ddos off by default"
+        exit 1
+      else
+      echo "PASS: default"
+      fi
 
     - nginx -s stop
