@@ -41,3 +41,11 @@ http {
     }
 }
 ```
+
+### Benchmark
+Using [wrk](https://github.com/wg/wrk) with the options `-t16 -c1000 -d10s`, we obtained the following results:
+
+|        |RPS        |Avg Latency|Latency Stdev|
+|--------|-----------|-----------|-------------|
+|Enabled |10882.32   |42.08 ms   |70.72 ms     |
+|Disabled|68731.38   |33.41 ms   |132.33 ms    |
