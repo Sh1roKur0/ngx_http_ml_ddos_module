@@ -170,6 +170,8 @@ error_env:
 }
 
 static void ngx_http_ml_ddos_exit_process(ngx_cycle_t *cycle) {
+    NGX_ASSERT(ort_session && ort_session_options && ort_env, cycle->log);
+
     if (ort_session) {
         ort_api->ReleaseSession(ort_session);
         ort_session = NULL;
@@ -192,15 +194,12 @@ static void ngx_http_ml_ddos_exit_process(ngx_cycle_t *cycle) {
 /// ===== DIRECTIVES ======
 
 static ngx_int_t ngx_http_ml_ddos_init(ngx_conf_t *cf) {
-    ngx_http_core_main_conf_t *cmcf;
-    ngx_http_handler_pt *h;
-
-    cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
-
-    h = ngx_array_push(&cmcf->phases[NGX_HTTP_REWRITE_PHASE].handlers);
-    if (h == NULL) {
+    ngx_http_core_main_conf_t *cmcf =
+        ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+    ngx_http_handler_pt *h =
+        ngx_array_push(&cmcf->phases[NGX_HTTP_REWRITE_PHASE].handlers);
+    if (!h)
         return NGX_ERROR;
-    }
 
     *h = ngx_http_ml_ddos_handler;
 
@@ -236,6 +235,8 @@ static char *ngx_http_ml_ddos_enable(ngx_conf_t *cf, ngx_command_t *cmd,
 /// ===== HANDLER =====
 
 static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
+    NGX_ASSERT(ort_api && ort_session, r->connection->log);
+
     ngx_http_ml_ddos_loc_conf_t *lcf =
         ngx_http_get_module_loc_conf(r, ngx_http_ml_ddos_module);
     if (!lcf->enabled)
@@ -249,13 +250,11 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
     ngx_str_set(&h->key, "X-HTTP-ML-DDOS");
     ngx_str_set(&h->value, "Enabled");
     h->hash = 1;
-#endif
-
-    NGX_ASSERT(ort_api && ort_session, r->connection->log);
 
     ngx_str_t client_ip = r->connection->addr_text;
     ngx_log_error(NGX_LOG_NOTICE, r->connection->log, NGX_OK,
                   LOG_PREFIX "IP %V requested URI \"%V\"", &client_ip, &r->uri);
+#endif
 
     return NGX_DECLINED;
 }
