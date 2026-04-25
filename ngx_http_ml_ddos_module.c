@@ -1,5 +1,6 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
+#include <ngx_thread_pool.h>
 #include <onnxruntime_c_api.h>
 
 #include <ctype.h>
@@ -248,6 +249,128 @@ static char *ngx_http_ml_ddos_enable(ngx_conf_t *cf, ngx_command_t *cmd,
 
 /// ===== HANDLER =====
 
+typedef struct {
+    float features[7];
+    ngx_int_t rc;
+} ngx_http_ml_ddos_task_ctx_t;
+
+typedef struct {
+    ngx_http_request_t *r;
+    ngx_http_ml_ddos_task_ctx_t ctx;
+} ngx_http_ml_ddos_wrap_t;
+
+static void ngx_http_ml_ddos_inference_thread(void *data, ngx_log_t *log) {
+    ngx_http_ml_ddos_wrap_t *wrap = data;
+    ngx_http_ml_ddos_task_ctx_t *ctx = &wrap->ctx;
+
+#if NGX_DEBUG
+    ngx_log_error(NGX_LOG_NOTICE, log, NGX_OK,
+                  LOG_PREFIX "PARAMS:\n"
+                             "\tintensivity: %f\n"
+                             "\trequest_length: %f\n"
+                             "\trequest_time: %.6f\n"
+                             "\turl_length: %f\n"
+                             "\targs_length: %f\n"
+                             "\tspecial_chars: %f\n"
+                             "\tua_length: %f\n",
+                  ctx->features[0], ctx->features[1], ctx->features[2],
+                  ctx->features[3], ctx->features[4], ctx->features[5],
+                  ctx->features[6]);
+#endif
+
+    OrtStatus *status = NULL;
+#define ONNX_ASSERT(expr)      \
+    do {                       \
+        if ((status = (expr))) \
+            goto done;         \
+    } while (0)
+
+    int64_t dims[2] = {1, 7};
+    OrtValue *input_tensor = NULL;
+    ONNX_ASSERT(ort_api->CreateTensorWithDataAsOrtValue(
+        ort_memory_info, ctx->features, sizeof(ctx->features), dims, 2,
+        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor));
+
+    const char *input_names[] = {"features"};
+    const char *output_names[] = {"label", "probabilities"};
+
+    OrtValue *outputs[2] = {NULL, NULL};
+    ONNX_ASSERT(ort_api->Run(ort_session, NULL, input_names,
+                             (const OrtValue *const *)&input_tensor, 1,
+                             output_names, 2, outputs));
+
+    ONNXType out_type;
+    ONNX_ASSERT(ort_api->GetValueType(outputs[1], &out_type));
+
+    if (out_type != ONNX_TYPE_SEQUENCE) {
+        ctx->rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
+        goto done;
+    }
+
+    size_t seq_len = 0;
+    ONNX_ASSERT(ort_api->GetValueCount(outputs[1], &seq_len));
+    if (seq_len == 0) {
+        ctx->rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
+        goto done;
+    }
+
+    OrtValue *seq_elem = NULL;
+    ONNX_ASSERT(ort_api->GetValue(outputs[1], 0, ort_allocator, &seq_elem));
+
+    int64_t key = 1;
+    OrtValue *tensor = NULL;
+    ONNX_ASSERT(ort_api->GetValue(seq_elem, key, ort_allocator, &tensor));
+
+    float *probs = NULL;
+    ONNX_ASSERT(ort_api->GetTensorMutableData(tensor, (void **)&probs));
+
+    float attack_prob = probs[1];
+
+#if NGX_DEBUG
+    ngx_log_error(NGX_LOG_NOTICE, log, NGX_OK,
+                  LOG_PREFIX "DDOS probability: %.6f", attack_prob);
+#endif
+
+    if (attack_prob > 0.85)
+        ctx->rc = NGX_HTTP_FORBIDDEN;
+    else if (attack_prob > 0.65)
+        ctx->rc = NGX_HTTP_TOO_MANY_REQUESTS;
+    else
+        ctx->rc = NGX_DECLINED;
+
+done:
+    if (status) {
+        ngx_log_error(NGX_LOG_ERR, log, NGX_ERROR, LOG_PREFIX "ONNX error: %s",
+                      ort_api->GetErrorMessage(status));
+        ort_api->ReleaseStatus(status);
+        ctx->rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    if (input_tensor)
+        ort_api->ReleaseValue(input_tensor);
+    if (outputs[0])
+        ort_api->ReleaseValue(outputs[0]);
+    if (outputs[1])
+        ort_api->ReleaseValue(outputs[1]);
+    if (tensor)
+        ort_api->ReleaseValue(tensor);
+    if (seq_elem)
+        ort_api->ReleaseValue(seq_elem);
+}
+
+static void ngx_http_ml_ddos_inference_done(ngx_event_t *ev) {
+    ngx_http_request_t *r = ev->data;
+    ngx_http_ml_ddos_wrap_t *wrap =
+        ngx_http_get_module_ctx(r, ngx_http_ml_ddos_module);
+
+    if (!wrap) {
+        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    ngx_http_finalize_request(r, wrap->ctx.rc);
+}
+
 static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
     NGX_ASSERT(ort_api && ort_session, r->connection->log);
 
@@ -265,6 +388,15 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
     ngx_str_set(&h->value, "Enabled");
     h->hash = 1;
 #endif
+
+    ngx_http_ml_ddos_wrap_t *wrap =
+        ngx_pcalloc(r->pool, sizeof(ngx_http_ml_ddos_wrap_t));
+    if (!wrap)
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+
+    ngx_http_set_ctx(r, wrap, ngx_http_ml_ddos_module);
+    wrap->r = r;
+    ngx_http_ml_ddos_task_ctx_t *ctx = &wrap->ctx;
 
     float intensity = (float)r->connection->requests;
     float request_length = (float)r->request_length;
@@ -284,98 +416,34 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
         if (!isalnum((unsigned char)r->args.data[i]))
             special_chars++;
 
-#if NGX_DEBUG
-    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, NGX_OK,
-                  LOG_PREFIX "PARAMS:\n"
-                             "\tintensivity: %f\n"
-                             "\trequest_length: %f\n"
-                             "\trequest_time: %.6f\n"
-                             "\turl_length: %f\n"
-                             "\targs_length: %f\n"
-                             "\tspecial_chars: %f\n"
-                             "\tua_length: %f\n",
-                  intensity, request_length, request_time, url_length,
-                  args_length, special_chars, ua_length);
-#endif
+    ctx->features[0] = intensity;
+    ctx->features[1] = request_length;
+    ctx->features[2] = request_time;
+    ctx->features[3] = url_length;
+    ctx->features[4] = args_length;
+    ctx->features[5] = special_chars;
+    ctx->features[6] = ua_length;
 
-    float features[7] = {intensity,   request_length, request_time, url_length,
-                         args_length, special_chars,  ua_length};
+    static ngx_str_t pool_name = ngx_string("ml_ddos");
+    ngx_thread_pool_t *tpool =
+        ngx_thread_pool_get((ngx_cycle_t *)ngx_cycle, &pool_name);
+    if (!tpool)
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    ngx_thread_task_t *task = ngx_pcalloc(r->pool, sizeof(ngx_thread_task_t));
+    if (!task)
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
 
-    ngx_int_t rc = NGX_DECLINED;
-    OrtStatus *status = NULL;
-#define ONNX_ASSERT(expr)      \
-    do {                       \
-        if ((status = (expr))) \
-            goto onnx_error;   \
-    } while (0)
+    task->handler = ngx_http_ml_ddos_inference_thread;
+    task->ctx = wrap;
+    task->event.handler = ngx_http_ml_ddos_inference_done;
+    task->event.data = r;
 
-    int64_t dims[2] = {1, 7};
-    OrtValue *input_tensor = NULL;
-    ONNX_ASSERT(ort_api->CreateTensorWithDataAsOrtValue(
-        ort_memory_info, features, sizeof(features), dims, 2,
-        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor));
+    r->main->count++;
 
-    const char *input_names[] = {"features"};
-    const char *output_names[] = {"label", "probabilities"};
+    if (ngx_thread_task_post(tpool, task) != NGX_OK) {
+        r->main->count--;
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
 
-    OrtValue *outputs[2] = {NULL, NULL};
-    ONNX_ASSERT(ort_api->Run(ort_session, NULL, input_names,
-                             (const OrtValue *const *)&input_tensor, 1,
-                             output_names, 2, outputs));
-
-    ONNXType out_type;
-    ONNX_ASSERT(ort_api->GetValueType(outputs[1], &out_type));
-
-    if (out_type != ONNX_TYPE_SEQUENCE)
-        goto onnx_error;
-
-    size_t seq_len = 0;
-    ONNX_ASSERT(ort_api->GetValueCount(outputs[1], &seq_len));
-    if (seq_len == 0)
-        goto onnx_error;
-
-    OrtValue *seq_elem = NULL;
-    ONNX_ASSERT(ort_api->GetValue(outputs[1], 0, ort_allocator, &seq_elem));
-
-    int64_t key = 1;
-    OrtValue *tensor = NULL;
-    ONNX_ASSERT(ort_api->GetValue(seq_elem, key, ort_allocator, &tensor));
-
-    float *probs = NULL;
-    ONNX_ASSERT(ort_api->GetTensorMutableData(tensor, (void **)&probs));
-
-    float attack_prob = probs[1];
-
-#if NGX_DEBUG
-    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, NGX_OK,
-                  LOG_PREFIX "DDOS probability: %.6f", attack_prob);
-#endif
-
-    if (attack_prob > 0.85)
-        rc = NGX_HTTP_FORBIDDEN;
-    else if (attack_prob > 0.65)
-        rc = NGX_HTTP_TOO_MANY_REQUESTS;
-
-    goto cleanup;
-
-onnx_error:
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, NGX_ERROR,
-                  LOG_PREFIX "ONNX error: %s",
-                  ort_api->GetErrorMessage(status));
-    ort_api->ReleaseStatus(status);
-    rc = NGX_ERROR;
-
-cleanup:
-    if (input_tensor)
-        ort_api->ReleaseValue(input_tensor);
-    if (outputs[0])
-        ort_api->ReleaseValue(outputs[0]);
-    if (outputs[1])
-        ort_api->ReleaseValue(outputs[1]);
-    if (tensor)
-        ort_api->ReleaseValue(tensor);
-    if (seq_elem)
-        ort_api->ReleaseValue(seq_elem);
-
-    return rc;
+    return NGX_AGAIN;
 }
