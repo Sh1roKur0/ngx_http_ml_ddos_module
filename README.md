@@ -22,6 +22,9 @@ load_module modules/ngx_http_ml_ddos_module.so;
 
 2. Configure the server:
 ``` nginx
+# Must use the name ml_ddos
+thread_pool ml_ddos threads=16 max_queue=65536;
+
 http {
     ml_ddos_path /etc/nginx/model.onnx;
     server {
