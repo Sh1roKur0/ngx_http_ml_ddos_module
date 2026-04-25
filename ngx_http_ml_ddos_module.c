@@ -147,7 +147,7 @@ static ngx_int_t ngx_http_ml_ddos_init_process(ngx_cycle_t *cycle) {
                                          ort_session_options, &ort_session)))
         goto error_session;
     if ((status = ort_api->GetAllocatorWithDefaultOptions(&ort_allocator)))
-        goto error_allocator;
+        goto error_memory;
     if ((status = ort_api->CreateCpuMemoryInfo(
              OrtArenaAllocator, OrtMemTypeDefault, &ort_memory_info)))
         goto error_memory;
@@ -158,16 +158,12 @@ static ngx_int_t ngx_http_ml_ddos_init_process(ngx_cycle_t *cycle) {
     return NGX_OK;
 
 error_memory:
-    ort_api->ReleaseAllocator(ort_allocator);
-error_allocator:
     ort_api->ReleaseSession(ort_session);
 error_session:
     ort_api->ReleaseSessionOptions(ort_session_options);
 error_options:
     ort_api->ReleaseEnv(ort_env);
 error_env:
-    ort_api->ReleaseStatus(status);
-
     ngx_log_error(NGX_LOG_ERR, cycle->log, NGX_ERROR,
                   LOG_PREFIX "ONNX initialize failed: %s",
                   ort_api->GetErrorMessage(status));
@@ -376,6 +372,10 @@ cleanup:
         ort_api->ReleaseValue(outputs[0]);
     if (outputs[1])
         ort_api->ReleaseValue(outputs[1]);
+    if (tensor)
+        ort_api->ReleaseValue(tensor);
+    if (seq_elem)
+        ort_api->ReleaseValue(seq_elem);
 
     return rc;
 }
