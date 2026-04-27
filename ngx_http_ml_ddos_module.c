@@ -363,7 +363,6 @@ done:
 }
 
 static void ngx_http_ml_ddos_inference_done(ngx_event_t *ev) {
-    ngx_log_error(NGX_LOG_NOTICE, ev->log, 0, "FINALIZE");
     ngx_http_ml_ddos_task_ctx_t *ctx = ev->data;
     ngx_http_finalize_request(ctx->r, ctx->rc);
 }
@@ -433,7 +432,5 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
     }
     r->main->count++;
 
-    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0, "ML DONE rc=%d r=%p",
-                  ctx->rc, ctx->r);
     return NGX_AGAIN;
 }
