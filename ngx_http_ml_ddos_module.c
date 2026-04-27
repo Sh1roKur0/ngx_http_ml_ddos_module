@@ -28,6 +28,8 @@ typedef struct {
     ngx_flag_t enabled;
 } ngx_http_ml_ddos_loc_conf_t;
 
+ngx_thread_pool_t *ngx_http_ml_ddos_thread_pool = NULL;
+
 static const OrtApi *ort_api = NULL;
 static OrtEnv *ort_env = NULL;
 static OrtSessionOptions *ort_session_options = NULL;
@@ -218,6 +220,13 @@ static ngx_int_t ngx_http_ml_ddos_init(ngx_conf_t *cf) {
 
     *h = ngx_http_ml_ddos_handler;
 
+    static ngx_str_t thread_pool_name = ngx_string("ml_ddos");
+    ngx_http_ml_ddos_thread_pool = ngx_thread_pool_add(cf, &thread_pool_name);
+    if (!ngx_http_ml_ddos_thread_pool) {
+        ngx_log_error(NGX_LOG_EMERG, cf->log, NGX_ERROR,
+                      LOG_PREFIX "failed to create a thread pool");
+    }
+
     return NGX_OK;
 }
 
@@ -251,17 +260,12 @@ static char *ngx_http_ml_ddos_enable(ngx_conf_t *cf, ngx_command_t *cmd,
 
 typedef struct {
     float features[7];
+    ngx_http_request_t *r;
     ngx_int_t rc;
 } ngx_http_ml_ddos_task_ctx_t;
 
-typedef struct {
-    ngx_http_request_t *r;
-    ngx_http_ml_ddos_task_ctx_t ctx;
-} ngx_http_ml_ddos_wrap_t;
-
 static void ngx_http_ml_ddos_inference_thread(void *data, ngx_log_t *log) {
-    ngx_http_ml_ddos_wrap_t *wrap = data;
-    ngx_http_ml_ddos_task_ctx_t *ctx = &wrap->ctx;
+    ngx_http_ml_ddos_task_ctx_t *ctx = data;
 
 #if NGX_DEBUG
     ngx_log_error(NGX_LOG_NOTICE, log, NGX_OK,
@@ -359,16 +363,9 @@ done:
 }
 
 static void ngx_http_ml_ddos_inference_done(ngx_event_t *ev) {
-    ngx_http_request_t *r = ev->data;
-    ngx_http_ml_ddos_wrap_t *wrap =
-        ngx_http_get_module_ctx(r, ngx_http_ml_ddos_module);
-
-    if (!wrap) {
-        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-        return;
-    }
-
-    ngx_http_finalize_request(r, wrap->ctx.rc);
+    ngx_log_error(NGX_LOG_NOTICE, ev->log, 0, "FINALIZE");
+    ngx_http_ml_ddos_task_ctx_t *ctx = ev->data;
+    ngx_http_finalize_request(ctx->r, ctx->rc);
 }
 
 static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
@@ -389,14 +386,13 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
     h->hash = 1;
 #endif
 
-    ngx_http_ml_ddos_wrap_t *wrap =
-        ngx_pcalloc(r->pool, sizeof(ngx_http_ml_ddos_wrap_t));
-    if (!wrap)
+    ngx_thread_task_t *task =
+        ngx_thread_task_alloc(r->pool, sizeof(ngx_http_ml_ddos_task_ctx_t));
+    if (!task)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
 
-    ngx_http_set_ctx(r, wrap, ngx_http_ml_ddos_module);
-    wrap->r = r;
-    ngx_http_ml_ddos_task_ctx_t *ctx = &wrap->ctx;
+    ngx_http_ml_ddos_task_ctx_t *ctx = task->ctx;
+    ctx->r = r;
 
     float intensity = (float)r->connection->requests;
     float request_length = (float)r->request_length;
@@ -424,26 +420,20 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
     ctx->features[5] = special_chars;
     ctx->features[6] = ua_length;
 
-    static ngx_str_t pool_name = ngx_string("ml_ddos");
-    ngx_thread_pool_t *tpool =
-        ngx_thread_pool_get((ngx_cycle_t *)ngx_cycle, &pool_name);
-    if (!tpool)
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    ngx_thread_task_t *task = ngx_pcalloc(r->pool, sizeof(ngx_thread_task_t));
-    if (!task)
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-
     task->handler = ngx_http_ml_ddos_inference_thread;
-    task->ctx = wrap;
     task->event.handler = ngx_http_ml_ddos_inference_done;
-    task->event.data = r;
+    task->event.data = ctx;
 
-    r->main->count++;
-
-    if (ngx_thread_task_post(tpool, task) != NGX_OK) {
-        r->main->count--;
+    ngx_int_t thread_status =
+        ngx_thread_task_post(ngx_http_ml_ddos_thread_pool, task);
+    if (thread_status != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, thread_status,
+                      LOG_PREFIX "Failed to add a task to the thread pool");
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
+    r->main->count++;
 
+    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0, "ML DONE rc=%d r=%p",
+                  ctx->rc, ctx->r);
     return NGX_AGAIN;
 }
