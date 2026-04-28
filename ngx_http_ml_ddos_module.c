@@ -4,6 +4,7 @@
 #include <onnxruntime_c_api.h>
 
 #include <ctype.h>
+#include <math.h>
 
 #define LOG_PREFIX "ML_DDOS: "
 #if NGX_DEBUG
@@ -102,7 +103,11 @@ static void *ngx_http_ml_ddos_create_main_conf(ngx_conf_t *cf) {
 }
 
 static void *ngx_http_ml_ddos_create_loc_conf(ngx_conf_t *cf) {
-    return ngx_pcalloc(cf->pool, sizeof(ngx_http_ml_ddos_loc_conf_t));
+    ngx_http_ml_ddos_loc_conf_t *lcf =
+        ngx_pcalloc(cf->pool, sizeof(ngx_http_ml_ddos_loc_conf_t));
+    lcf->block_threshold = NAN;
+    lcf->limit_threshold = NAN;
+    return lcf;
 }
 
 static char *ngx_http_ml_ddos_merge_loc_conf(ngx_conf_t *cf, void *parent,
@@ -114,10 +119,15 @@ static char *ngx_http_ml_ddos_merge_loc_conf(ngx_conf_t *cf, void *parent,
     if (conf->thread_pool == NULL) {
         conf->thread_pool = prev->thread_pool;
     }
-    conf->block_threshold =
-        prev->block_threshold ? prev->block_threshold : 0.85f;
-    conf->limit_threshold =
-        prev->limit_threshold ? prev->limit_threshold : 0.65f;
+    if (isnan(conf->block_threshold)) {
+        conf->block_threshold =
+            isnan(prev->block_threshold) ? 0.85f : prev->block_threshold;
+    }
+
+    if (isnan(conf->limit_threshold)) {
+        conf->limit_threshold =
+            isnan(prev->limit_threshold) ? 0.65f : prev->limit_threshold;
+    }
 
     return NGX_CONF_OK;
 }
@@ -281,17 +291,37 @@ static char *ngx_http_ml_ddos_enable(ngx_conf_t *cf, ngx_command_t *cmd,
         } else if (ngx_strncmp(value[i].data, block_str.data, block_str.len) ==
                    0) {
             GET_NAME(block_str);
-            lcf->block_threshold = ngx_atofp(name.data, name.len, 3) / 1000.0f;
+            ngx_int_t v = ngx_atofp(name.data, name.len, 3);
+            if (v == NGX_ERROR || v <= 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   LOG_PREFIX "invalid limit value \"%V\"",
+                                   &value[i]);
+                return NGX_CONF_ERROR;
+            }
+            lcf->block_threshold = v / 1000.0f;
         } else if (ngx_strncmp(value[i].data, limit_str.data, limit_str.len) ==
                    0) {
             GET_NAME(limit_str);
-            lcf->limit_threshold = ngx_atofp(name.data, name.len, 3) / 1000.0f;
+            ngx_int_t v = ngx_atofp(name.data, name.len, 3);
+            if (v == NGX_ERROR || v <= 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   LOG_PREFIX "invalid limit value \"%V\"",
+                                   &value[i]);
+                return NGX_CONF_ERROR;
+            }
+            lcf->limit_threshold = v / 1000.0f;
         } else {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, NGX_ERROR,
                                LOG_PREFIX "unknown parameter \"%V\"",
                                &value[i]);
             return NGX_CONF_ERROR;
         }
+    }
+
+    if (lcf->limit_threshold >= lcf->block_threshold) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           LOG_PREFIX "limit must be less than block");
+        return NGX_CONF_ERROR;
     }
 
 #undef GET_NAME
@@ -311,6 +341,7 @@ typedef struct {
 
 static void ngx_http_ml_ddos_inference_thread(void *data, ngx_log_t *log) {
     ngx_http_ml_ddos_task_ctx_t *ctx = data;
+    log = ctx->r->connection->log;
 
 #if NGX_DEBUG
     ngx_log_error(NGX_LOG_NOTICE, log, NGX_OK,
@@ -446,6 +477,7 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
     ngx_http_ml_ddos_task_ctx_t *ctx = task->ctx;
     ctx->block_threshold = lcf->block_threshold;
     ctx->limit_threshold = lcf->limit_threshold;
+    ctx->r = r;
 
     float intensity = (float)r->connection->requests;
     float request_length = (float)r->request_length;
@@ -474,8 +506,6 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
     ctx->features[6] = ua_length;
 
     if (lcf->thread_pool) {
-        ctx->r = r;
-
         task->handler = ngx_http_ml_ddos_inference_thread;
         task->event.handler = ngx_http_ml_ddos_inference_done;
         task->event.data = ctx;
