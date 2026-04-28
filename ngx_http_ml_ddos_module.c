@@ -146,6 +146,10 @@ static ngx_int_t ngx_http_ml_ddos_init_process(ngx_cycle_t *cycle) {
         goto error_env;
     if ((status = ort_api->CreateSessionOptions(&ort_session_options)))
         goto error_options;
+    if ((status = ort_api->SetIntraOpNumThreads(ort_session_options, 1)))
+        goto error_options;
+    if ((status = ort_api->SetInterOpNumThreads(ort_session_options, 1)))
+        goto error_options;
     if ((status = ort_api->CreateSession(ort_env, (const char *)model_path_cstr,
                                          ort_session_options, &ort_session)))
         goto error_session;
@@ -270,13 +274,13 @@ static void ngx_http_ml_ddos_inference_thread(void *data, ngx_log_t *log) {
 #if NGX_DEBUG
     ngx_log_error(NGX_LOG_NOTICE, log, NGX_OK,
                   LOG_PREFIX "PARAMS:\n"
-                             "\tintensivity: %f\n"
-                             "\trequest_length: %f\n"
-                             "\trequest_time: %.6f\n"
-                             "\turl_length: %f\n"
-                             "\targs_length: %f\n"
-                             "\tspecial_chars: %f\n"
-                             "\tua_length: %f\n",
+                             "\tintensivity:\t%f\n"
+                             "\trequest_length:\t%f\n"
+                             "\trequest_time:\t%.6f\n"
+                             "\turl_length:\t%f\n"
+                             "\targs_length:\t%f\n"
+                             "\tspecial_chars:\t%f\n"
+                             "\tua_length:\t%f",
                   ctx->features[0], ctx->features[1], ctx->features[2],
                   ctx->features[3], ctx->features[4], ctx->features[5],
                   ctx->features[6]);

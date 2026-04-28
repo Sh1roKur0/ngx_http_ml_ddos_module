@@ -50,5 +50,5 @@ Using [wrk](https://github.com/wg/wrk) with the options `-t16 -c1000 -d10s`, we 
 
 |        |RPS        |Avg Latency|Latency Stdev|
 |--------|-----------|-----------|-------------|
-|Enabled |25363.97   |62.74 ms   |150.68 ms    |
+|Enabled |56103.72   |44.60 ms   |150.68 ms    |
 |Disabled|68731.38   |33.41 ms   |132.33 ms    |
