@@ -22,7 +22,6 @@ load_module modules/ngx_http_ml_ddos_module.so;
 
 2. Configure the server:
 ``` nginx
-# Must use the name ml_ddos
 thread_pool ml_ddos threads=16 max_queue=65536;
 
 http {
@@ -31,7 +30,13 @@ http {
         listen 80;
         server_name localhost;
 
-        location / {
+        location /ml_async {
+            ml_ddos on thread=ml_ddos block=0.8 limit=0.6;
+            proxy_pass http://backend_upstream;
+        }
+        
+        location /ml_sync {
+            # Default options: without thread pool, block=0.85, limit=0.65
             ml_ddos on;
             proxy_pass http://backend_upstream;
         }
