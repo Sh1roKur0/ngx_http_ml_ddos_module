@@ -364,6 +364,10 @@ done:
 
 static void ngx_http_ml_ddos_inference_done(ngx_event_t *ev) {
     ngx_http_ml_ddos_task_ctx_t *ctx = ev->data;
+
+    if (ctx->rc == NGX_DECLINED)
+        ctx->r->phase_handler++;
+
     ngx_http_finalize_request(ctx->r, ctx->rc);
 }
 
