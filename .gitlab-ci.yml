@@ -103,6 +103,8 @@ test:
 
       error_log /etc/nginx/logs/error.log info;
 
+      thread_pool ml_ddos threads=4 max_queue=65536;
+
       http {
           ml_ddos_path /etc/nginx/model.onnx;
           server {

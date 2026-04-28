@@ -1,5 +1,6 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
+#include <ngx_thread_pool.h>
 #include <onnxruntime_c_api.h>
 
 #include <ctype.h>
@@ -26,6 +27,8 @@ typedef struct {
 typedef struct {
     ngx_flag_t enabled;
 } ngx_http_ml_ddos_loc_conf_t;
+
+ngx_thread_pool_t *ngx_http_ml_ddos_thread_pool = NULL;
 
 static const OrtApi *ort_api = NULL;
 static OrtEnv *ort_env = NULL;
@@ -147,7 +150,7 @@ static ngx_int_t ngx_http_ml_ddos_init_process(ngx_cycle_t *cycle) {
                                          ort_session_options, &ort_session)))
         goto error_session;
     if ((status = ort_api->GetAllocatorWithDefaultOptions(&ort_allocator)))
-        goto error_allocator;
+        goto error_memory;
     if ((status = ort_api->CreateCpuMemoryInfo(
              OrtArenaAllocator, OrtMemTypeDefault, &ort_memory_info)))
         goto error_memory;
@@ -158,16 +161,12 @@ static ngx_int_t ngx_http_ml_ddos_init_process(ngx_cycle_t *cycle) {
     return NGX_OK;
 
 error_memory:
-    ort_api->ReleaseAllocator(ort_allocator);
-error_allocator:
     ort_api->ReleaseSession(ort_session);
 error_session:
     ort_api->ReleaseSessionOptions(ort_session_options);
 error_options:
     ort_api->ReleaseEnv(ort_env);
 error_env:
-    ort_api->ReleaseStatus(status);
-
     ngx_log_error(NGX_LOG_ERR, cycle->log, NGX_ERROR,
                   LOG_PREFIX "ONNX initialize failed: %s",
                   ort_api->GetErrorMessage(status));
@@ -221,6 +220,13 @@ static ngx_int_t ngx_http_ml_ddos_init(ngx_conf_t *cf) {
 
     *h = ngx_http_ml_ddos_handler;
 
+    static ngx_str_t thread_pool_name = ngx_string("ml_ddos");
+    ngx_http_ml_ddos_thread_pool = ngx_thread_pool_add(cf, &thread_pool_name);
+    if (!ngx_http_ml_ddos_thread_pool) {
+        ngx_log_error(NGX_LOG_EMERG, cf->log, NGX_ERROR,
+                      LOG_PREFIX "failed to create a thread pool");
+    }
+
     return NGX_OK;
 }
 
@@ -252,6 +258,119 @@ static char *ngx_http_ml_ddos_enable(ngx_conf_t *cf, ngx_command_t *cmd,
 
 /// ===== HANDLER =====
 
+typedef struct {
+    float features[7];
+    ngx_http_request_t *r;
+    ngx_int_t rc;
+} ngx_http_ml_ddos_task_ctx_t;
+
+static void ngx_http_ml_ddos_inference_thread(void *data, ngx_log_t *log) {
+    ngx_http_ml_ddos_task_ctx_t *ctx = data;
+
+#if NGX_DEBUG
+    ngx_log_error(NGX_LOG_NOTICE, log, NGX_OK,
+                  LOG_PREFIX "PARAMS:\n"
+                             "\tintensivity: %f\n"
+                             "\trequest_length: %f\n"
+                             "\trequest_time: %.6f\n"
+                             "\turl_length: %f\n"
+                             "\targs_length: %f\n"
+                             "\tspecial_chars: %f\n"
+                             "\tua_length: %f\n",
+                  ctx->features[0], ctx->features[1], ctx->features[2],
+                  ctx->features[3], ctx->features[4], ctx->features[5],
+                  ctx->features[6]);
+#endif
+
+    OrtStatus *status = NULL;
+#define ONNX_ASSERT(expr)      \
+    do {                       \
+        if ((status = (expr))) \
+            goto done;         \
+    } while (0)
+
+    int64_t dims[2] = {1, 7};
+    OrtValue *input_tensor = NULL;
+    ONNX_ASSERT(ort_api->CreateTensorWithDataAsOrtValue(
+        ort_memory_info, ctx->features, sizeof(ctx->features), dims, 2,
+        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor));
+
+    const char *input_names[] = {"features"};
+    const char *output_names[] = {"label", "probabilities"};
+
+    OrtValue *outputs[2] = {NULL, NULL};
+    ONNX_ASSERT(ort_api->Run(ort_session, NULL, input_names,
+                             (const OrtValue *const *)&input_tensor, 1,
+                             output_names, 2, outputs));
+
+    ONNXType out_type;
+    ONNX_ASSERT(ort_api->GetValueType(outputs[1], &out_type));
+
+    if (out_type != ONNX_TYPE_SEQUENCE) {
+        ctx->rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
+        goto done;
+    }
+
+    size_t seq_len = 0;
+    ONNX_ASSERT(ort_api->GetValueCount(outputs[1], &seq_len));
+    if (seq_len == 0) {
+        ctx->rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
+        goto done;
+    }
+
+    OrtValue *seq_elem = NULL;
+    ONNX_ASSERT(ort_api->GetValue(outputs[1], 0, ort_allocator, &seq_elem));
+
+    int64_t key = 1;
+    OrtValue *tensor = NULL;
+    ONNX_ASSERT(ort_api->GetValue(seq_elem, key, ort_allocator, &tensor));
+
+    float *probs = NULL;
+    ONNX_ASSERT(ort_api->GetTensorMutableData(tensor, (void **)&probs));
+
+    float attack_prob = probs[1];
+
+#if NGX_DEBUG
+    ngx_log_error(NGX_LOG_NOTICE, log, NGX_OK,
+                  LOG_PREFIX "DDOS probability: %.6f", attack_prob);
+#endif
+
+    if (attack_prob > 0.85)
+        ctx->rc = NGX_HTTP_FORBIDDEN;
+    else if (attack_prob > 0.65)
+        ctx->rc = NGX_HTTP_TOO_MANY_REQUESTS;
+    else
+        ctx->rc = NGX_DECLINED;
+
+done:
+    if (status) {
+        ngx_log_error(NGX_LOG_ERR, log, NGX_ERROR, LOG_PREFIX "ONNX error: %s",
+                      ort_api->GetErrorMessage(status));
+        ort_api->ReleaseStatus(status);
+        ctx->rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    if (input_tensor)
+        ort_api->ReleaseValue(input_tensor);
+    if (outputs[0])
+        ort_api->ReleaseValue(outputs[0]);
+    if (outputs[1])
+        ort_api->ReleaseValue(outputs[1]);
+    if (tensor)
+        ort_api->ReleaseValue(tensor);
+    if (seq_elem)
+        ort_api->ReleaseValue(seq_elem);
+}
+
+static void ngx_http_ml_ddos_inference_done(ngx_event_t *ev) {
+    ngx_http_ml_ddos_task_ctx_t *ctx = ev->data;
+
+    if (ctx->rc == NGX_DECLINED)
+        ctx->r->phase_handler++;
+
+    ngx_http_finalize_request(ctx->r, ctx->rc);
+}
+
 static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
     NGX_ASSERT(ort_api && ort_session, r->connection->log);
 
@@ -269,6 +388,14 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
     ngx_str_set(&h->value, "Enabled");
     h->hash = 1;
 #endif
+
+    ngx_thread_task_t *task =
+        ngx_thread_task_alloc(r->pool, sizeof(ngx_http_ml_ddos_task_ctx_t));
+    if (!task)
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+
+    ngx_http_ml_ddos_task_ctx_t *ctx = task->ctx;
+    ctx->r = r;
 
     float intensity = (float)r->connection->requests;
     float request_length = (float)r->request_length;
@@ -288,94 +415,26 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
         if (!isalnum((unsigned char)r->args.data[i]))
             special_chars++;
 
-#if NGX_DEBUG
-    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, NGX_OK,
-                  LOG_PREFIX "PARAMS:\n"
-                             "\tintensivity: %f\n"
-                             "\trequest_length: %f\n"
-                             "\trequest_time: %.6f\n"
-                             "\turl_length: %f\n"
-                             "\targs_length: %f\n"
-                             "\tspecial_chars: %f\n"
-                             "\tua_length: %f\n",
-                  intensity, request_length, request_time, url_length,
-                  args_length, special_chars, ua_length);
-#endif
+    ctx->features[0] = intensity;
+    ctx->features[1] = request_length;
+    ctx->features[2] = request_time;
+    ctx->features[3] = url_length;
+    ctx->features[4] = args_length;
+    ctx->features[5] = special_chars;
+    ctx->features[6] = ua_length;
 
-    float features[7] = {intensity,   request_length, request_time, url_length,
-                         args_length, special_chars,  ua_length};
+    task->handler = ngx_http_ml_ddos_inference_thread;
+    task->event.handler = ngx_http_ml_ddos_inference_done;
+    task->event.data = ctx;
 
-    ngx_int_t rc = NGX_DECLINED;
-    OrtStatus *status = NULL;
-#define ONNX_ASSERT(expr)      \
-    do {                       \
-        if ((status = (expr))) \
-            goto onnx_error;   \
-    } while (0)
+    ngx_int_t thread_status =
+        ngx_thread_task_post(ngx_http_ml_ddos_thread_pool, task);
+    if (thread_status != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, thread_status,
+                      LOG_PREFIX "Failed to add a task to the thread pool");
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    r->main->count++;
 
-    int64_t dims[2] = {1, 7};
-    OrtValue *input_tensor = NULL;
-    ONNX_ASSERT(ort_api->CreateTensorWithDataAsOrtValue(
-        ort_memory_info, features, sizeof(features), dims, 2,
-        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor));
-
-    const char *input_names[] = {"features"};
-    const char *output_names[] = {"label", "probabilities"};
-
-    OrtValue *outputs[2] = {NULL, NULL};
-    ONNX_ASSERT(ort_api->Run(ort_session, NULL, input_names,
-                             (const OrtValue *const *)&input_tensor, 1,
-                             output_names, 2, outputs));
-
-    ONNXType out_type;
-    ONNX_ASSERT(ort_api->GetValueType(outputs[1], &out_type));
-
-    if (out_type != ONNX_TYPE_SEQUENCE)
-        goto onnx_error;
-
-    size_t seq_len = 0;
-    ONNX_ASSERT(ort_api->GetValueCount(outputs[1], &seq_len));
-    if (seq_len == 0)
-        goto onnx_error;
-
-    OrtValue *seq_elem = NULL;
-    ONNX_ASSERT(ort_api->GetValue(outputs[1], 0, ort_allocator, &seq_elem));
-
-    int64_t key = 1;
-    OrtValue *tensor = NULL;
-    ONNX_ASSERT(ort_api->GetValue(seq_elem, key, ort_allocator, &tensor));
-
-    float *probs = NULL;
-    ONNX_ASSERT(ort_api->GetTensorMutableData(tensor, (void **)&probs));
-
-    float attack_prob = probs[1];
-
-#if NGX_DEBUG
-    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, NGX_OK,
-                  LOG_PREFIX "DDOS probability: %.6f", attack_prob);
-#endif
-
-    if (attack_prob > 0.85)
-        rc = NGX_HTTP_FORBIDDEN;
-    else if (attack_prob > 0.65)
-        rc = NGX_HTTP_TOO_MANY_REQUESTS;
-
-    goto cleanup;
-
-onnx_error:
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, NGX_ERROR,
-                  LOG_PREFIX "ONNX error: %s",
-                  ort_api->GetErrorMessage(status));
-    ort_api->ReleaseStatus(status);
-    rc = NGX_ERROR;
-
-cleanup:
-    if (input_tensor)
-        ort_api->ReleaseValue(input_tensor);
-    if (outputs[0])
-        ort_api->ReleaseValue(outputs[0]);
-    if (outputs[1])
-        ort_api->ReleaseValue(outputs[1]);
-
-    return rc;
+    return NGX_AGAIN;
 }

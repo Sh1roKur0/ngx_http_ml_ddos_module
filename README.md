@@ -22,6 +22,9 @@ load_module modules/ngx_http_ml_ddos_module.so;
 
 2. Configure the server:
 ``` nginx
+# Must use the name ml_ddos
+thread_pool ml_ddos threads=16 max_queue=65536;
+
 http {
     ml_ddos_path /etc/nginx/model.onnx;
     server {
@@ -47,5 +50,5 @@ Using [wrk](https://github.com/wg/wrk) with the options `-t16 -c1000 -d10s`, we 
 
 |        |RPS        |Avg Latency|Latency Stdev|
 |--------|-----------|-----------|-------------|
-|Enabled |10882.32   |42.08 ms   |70.72 ms     |
+|Enabled |25363.97   |62.74 ms   |150.68 ms    |
 |Disabled|68731.38   |33.41 ms   |132.33 ms    |
