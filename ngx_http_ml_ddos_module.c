@@ -4,6 +4,7 @@
 #include <onnxruntime_c_api.h>
 
 #include <ctype.h>
+#include <math.h>
 
 #define LOG_PREFIX "ML_DDOS: "
 #if NGX_DEBUG
@@ -26,9 +27,10 @@ typedef struct {
 
 typedef struct {
     ngx_flag_t enabled;
+    ngx_thread_pool_t *thread_pool;
+    float block_threshold;
+    float limit_threshold;
 } ngx_http_ml_ddos_loc_conf_t;
-
-ngx_thread_pool_t *ngx_http_ml_ddos_thread_pool = NULL;
 
 static const OrtApi *ort_api = NULL;
 static OrtEnv *ort_env = NULL;
@@ -60,10 +62,10 @@ static ngx_command_t ngx_http_ml_ddos_commands[] = {
      0,                                   // configuration offset
      NULL},
 
-    {ngx_string("ml_ddos"),             // directive
-     NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, // location context
-     ngx_http_ml_ddos_enable,           // configuration setup function
-     NGX_HTTP_LOC_CONF_OFFSET,          // local offset
+    {ngx_string("ml_ddos"),              // directive
+     NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, // location context
+     ngx_http_ml_ddos_enable,            // configuration setup function
+     NGX_HTTP_LOC_CONF_OFFSET,           // local offset
      offsetof(ngx_http_ml_ddos_loc_conf_t, enabled), // configuration offset
      NULL},
 
@@ -101,7 +103,11 @@ static void *ngx_http_ml_ddos_create_main_conf(ngx_conf_t *cf) {
 }
 
 static void *ngx_http_ml_ddos_create_loc_conf(ngx_conf_t *cf) {
-    return ngx_pcalloc(cf->pool, sizeof(ngx_http_ml_ddos_loc_conf_t));
+    ngx_http_ml_ddos_loc_conf_t *lcf =
+        ngx_pcalloc(cf->pool, sizeof(ngx_http_ml_ddos_loc_conf_t));
+    lcf->block_threshold = NAN;
+    lcf->limit_threshold = NAN;
+    return lcf;
 }
 
 static char *ngx_http_ml_ddos_merge_loc_conf(ngx_conf_t *cf, void *parent,
@@ -110,6 +116,18 @@ static char *ngx_http_ml_ddos_merge_loc_conf(ngx_conf_t *cf, void *parent,
     ngx_http_ml_ddos_loc_conf_t *conf = child;
 
     ngx_conf_merge_value(conf->enabled, prev->enabled, 0);
+    if (conf->thread_pool == NULL) {
+        conf->thread_pool = prev->thread_pool;
+    }
+    if (isnan(conf->block_threshold)) {
+        conf->block_threshold =
+            isnan(prev->block_threshold) ? 0.85f : prev->block_threshold;
+    }
+
+    if (isnan(conf->limit_threshold)) {
+        conf->limit_threshold =
+            isnan(prev->limit_threshold) ? 0.65f : prev->limit_threshold;
+    }
 
     return NGX_CONF_OK;
 }
@@ -145,6 +163,10 @@ static ngx_int_t ngx_http_ml_ddos_init_process(ngx_cycle_t *cycle) {
                                      &ort_env)))
         goto error_env;
     if ((status = ort_api->CreateSessionOptions(&ort_session_options)))
+        goto error_options;
+    if ((status = ort_api->SetIntraOpNumThreads(ort_session_options, 1)))
+        goto error_options;
+    if ((status = ort_api->SetInterOpNumThreads(ort_session_options, 1)))
         goto error_options;
     if ((status = ort_api->CreateSession(ort_env, (const char *)model_path_cstr,
                                          ort_session_options, &ort_session)))
@@ -220,13 +242,6 @@ static ngx_int_t ngx_http_ml_ddos_init(ngx_conf_t *cf) {
 
     *h = ngx_http_ml_ddos_handler;
 
-    static ngx_str_t thread_pool_name = ngx_string("ml_ddos");
-    ngx_http_ml_ddos_thread_pool = ngx_thread_pool_add(cf, &thread_pool_name);
-    if (!ngx_http_ml_ddos_thread_pool) {
-        ngx_log_error(NGX_LOG_EMERG, cf->log, NGX_ERROR,
-                      LOG_PREFIX "failed to create a thread pool");
-    }
-
     return NGX_OK;
 }
 
@@ -253,34 +268,121 @@ static char *ngx_http_ml_ddos_enable(ngx_conf_t *cf, ngx_command_t *cmd,
         return NGX_CONF_ERROR;
     }
 
+    static const ngx_str_t thread_str = ngx_string("thread=");
+    static const ngx_str_t block_str = ngx_string("block=");
+    static const ngx_str_t limit_str = ngx_string("limit=");
+
+#define GET_NAME(str)                   \
+    ngx_str_t name;                     \
+    name.len = value[i].len - str.len;  \
+    name.data = value[i].data + str.len
+
+    for (ngx_uint_t i = 2; i < cf->args->nelts; i++) {
+        if (ngx_strncmp(value[i].data, thread_str.data, thread_str.len) == 0) {
+            GET_NAME(thread_str);
+
+            lcf->thread_pool = ngx_thread_pool_add(cf, &name);
+            if (lcf->thread_pool == NULL) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, NGX_ERROR,
+                                   LOG_PREFIX "invalid thread pool \"%V\"",
+                                   &name);
+                return NGX_CONF_ERROR;
+            }
+        } else if (ngx_strncmp(value[i].data, block_str.data, block_str.len) ==
+                   0) {
+            GET_NAME(block_str);
+            ngx_int_t v = ngx_atofp(name.data, name.len, 3);
+            if (v == NGX_ERROR || v <= 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   LOG_PREFIX "invalid limit value \"%V\"",
+                                   &value[i]);
+                return NGX_CONF_ERROR;
+            }
+            lcf->block_threshold = v / 1000.0f;
+        } else if (ngx_strncmp(value[i].data, limit_str.data, limit_str.len) ==
+                   0) {
+            GET_NAME(limit_str);
+            ngx_int_t v = ngx_atofp(name.data, name.len, 3);
+            if (v == NGX_ERROR || v <= 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   LOG_PREFIX "invalid limit value \"%V\"",
+                                   &value[i]);
+                return NGX_CONF_ERROR;
+            }
+            lcf->limit_threshold = v / 1000.0f;
+        } else {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, NGX_ERROR,
+                               LOG_PREFIX "unknown parameter \"%V\"",
+                               &value[i]);
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    if (lcf->limit_threshold >= lcf->block_threshold) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           LOG_PREFIX "limit must be less than block");
+        return NGX_CONF_ERROR;
+    }
+
+#undef GET_NAME
+
     return NGX_CONF_OK;
 }
 
 /// ===== HANDLER =====
 
 typedef struct {
-    float features[7];
+    float block_threshold;
+    float limit_threshold;
     ngx_http_request_t *r;
     ngx_int_t rc;
 } ngx_http_ml_ddos_task_ctx_t;
 
-static void ngx_http_ml_ddos_inference_thread(void *data, ngx_log_t *log) {
+static void ngx_http_ml_ddos_worker(void *data, ngx_log_t *log) {
     ngx_http_ml_ddos_task_ctx_t *ctx = data;
+    ngx_http_request_t *r = ctx->r;
+    log = r->connection->log;
+
+    float intensity = (float)r->connection->requests;
+    float request_length = (float)r->request_length;
+    float url_length = (float)r->request_line.len;
+    float args_length = (float)r->args.len + !!r->args.len;
+    float ua_length = r->headers_in.user_agent
+                          ? (float)r->headers_in.user_agent->value.len
+                          : 0.0f;
+
+    ngx_time_t *tp = ngx_timeofday();
+    ngx_msec_t ms =
+        (tp->sec - r->start_sec) * 1000 + (tp->msec - r->start_msec);
+    float request_time = ms > 0 ? (float)ms / 1000.0f : 0.0f;
+
+    float special_chars = 0.0f;
+    for (size_t i = 0; i < r->args.len; i++)
+        if (!isalnum((unsigned char)r->args.data[i]))
+            special_chars++;
 
 #if NGX_DEBUG
     ngx_log_error(NGX_LOG_NOTICE, log, NGX_OK,
                   LOG_PREFIX "PARAMS:\n"
-                             "\tintensivity: %f\n"
-                             "\trequest_length: %f\n"
-                             "\trequest_time: %.6f\n"
-                             "\turl_length: %f\n"
-                             "\targs_length: %f\n"
-                             "\tspecial_chars: %f\n"
-                             "\tua_length: %f\n",
-                  ctx->features[0], ctx->features[1], ctx->features[2],
-                  ctx->features[3], ctx->features[4], ctx->features[5],
-                  ctx->features[6]);
+                             "\tintensivity:\t%f\n"
+                             "\trequest_length:\t%f\n"
+                             "\trequest_time:\t%.6f\n"
+                             "\turl_length:\t%f\n"
+                             "\targs_length:\t%f\n"
+                             "\tspecial_chars:\t%f\n"
+                             "\tua_length:\t%f",
+                  intensity, request_length, request_time, url_length,
+                  args_length, special_chars, ua_length);
 #endif
+
+    float features[7];
+    features[0] = intensity;
+    features[1] = request_length;
+    features[2] = request_time;
+    features[3] = url_length;
+    features[4] = args_length;
+    features[5] = special_chars;
+    features[6] = ua_length;
 
     OrtStatus *status = NULL;
 #define ONNX_ASSERT(expr)      \
@@ -292,7 +394,7 @@ static void ngx_http_ml_ddos_inference_thread(void *data, ngx_log_t *log) {
     int64_t dims[2] = {1, 7};
     OrtValue *input_tensor = NULL;
     ONNX_ASSERT(ort_api->CreateTensorWithDataAsOrtValue(
-        ort_memory_info, ctx->features, sizeof(ctx->features), dims, 2,
+        ort_memory_info, features, sizeof(features), dims, 2,
         ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor));
 
     const char *input_names[] = {"features"};
@@ -335,9 +437,9 @@ static void ngx_http_ml_ddos_inference_thread(void *data, ngx_log_t *log) {
                   LOG_PREFIX "DDOS probability: %.6f", attack_prob);
 #endif
 
-    if (attack_prob > 0.85)
+    if (attack_prob > ctx->block_threshold)
         ctx->rc = NGX_HTTP_FORBIDDEN;
-    else if (attack_prob > 0.65)
+    else if (attack_prob > ctx->limit_threshold)
         ctx->rc = NGX_HTTP_TOO_MANY_REQUESTS;
     else
         ctx->rc = NGX_DECLINED;
@@ -362,7 +464,7 @@ done:
         ort_api->ReleaseValue(seq_elem);
 }
 
-static void ngx_http_ml_ddos_inference_done(ngx_event_t *ev) {
+static void ngx_http_ml_ddos_worker_done(ngx_event_t *ev) {
     ngx_http_ml_ddos_task_ctx_t *ctx = ev->data;
 
     if (ctx->rc == NGX_DECLINED)
@@ -380,6 +482,10 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
         return NGX_DECLINED;
 
 #if NGX_DEBUG
+    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, NGX_OK,
+                  LOG_PREFIX "thread pool %p; block %.3f; limit %.3f",
+                  lcf->thread_pool, lcf->block_threshold, lcf->limit_threshold);
+
     ngx_table_elt_t *h = ngx_list_push(&r->headers_out.headers);
     if (!h)
         return NGX_ERROR;
@@ -395,46 +501,26 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
 
     ngx_http_ml_ddos_task_ctx_t *ctx = task->ctx;
+    ctx->block_threshold = lcf->block_threshold;
+    ctx->limit_threshold = lcf->limit_threshold;
     ctx->r = r;
 
-    float intensity = (float)r->connection->requests;
-    float request_length = (float)r->request_length;
-    float url_length = (float)r->request_line.len;
-    float args_length = (float)r->args.len + !!r->args.len;
-    float ua_length = r->headers_in.user_agent
-                          ? (float)r->headers_in.user_agent->value.len
-                          : 0.0f;
+    if (lcf->thread_pool) {
+        task->handler = ngx_http_ml_ddos_worker;
+        task->event.handler = ngx_http_ml_ddos_worker_done;
+        task->event.data = ctx;
 
-    ngx_time_t *tp = ngx_timeofday();
-    ngx_msec_t ms =
-        (tp->sec - r->start_sec) * 1000 + (tp->msec - r->start_msec);
-    float request_time = ms > 0 ? (float)ms / 1000.0f : 0.0f;
+        ngx_int_t thread_status = ngx_thread_task_post(lcf->thread_pool, task);
+        if (thread_status != NGX_OK) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, thread_status,
+                          LOG_PREFIX "Failed to add a task to the thread pool");
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        r->main->count++;
 
-    float special_chars = 0.0f;
-    for (size_t i = 0; i < r->args.len; i++)
-        if (!isalnum((unsigned char)r->args.data[i]))
-            special_chars++;
-
-    ctx->features[0] = intensity;
-    ctx->features[1] = request_length;
-    ctx->features[2] = request_time;
-    ctx->features[3] = url_length;
-    ctx->features[4] = args_length;
-    ctx->features[5] = special_chars;
-    ctx->features[6] = ua_length;
-
-    task->handler = ngx_http_ml_ddos_inference_thread;
-    task->event.handler = ngx_http_ml_ddos_inference_done;
-    task->event.data = ctx;
-
-    ngx_int_t thread_status =
-        ngx_thread_task_post(ngx_http_ml_ddos_thread_pool, task);
-    if (thread_status != NGX_OK) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, thread_status,
-                      LOG_PREFIX "Failed to add a task to the thread pool");
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        return NGX_AGAIN;
+    } else {
+        ngx_http_ml_ddos_worker(ctx, r->connection->log);
+        return ctx->rc;
     }
-    r->main->count++;
-
-    return NGX_AGAIN;
 }

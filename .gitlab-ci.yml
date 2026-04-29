@@ -110,7 +110,14 @@ test:
           server {
               listen 8080;
 
-              location /ml {
+              location /ml_async {
+                  ml_ddos on thread=ml_ddos block=0.8 limit=0.6;
+                  default_type text/plain;
+                  return 200 "ML\n";
+              }
+
+
+              location /ml_sync {
                   ml_ddos on;
                   default_type text/plain;
                   return 200 "ML\n";
@@ -141,7 +148,10 @@ test:
       done
 
     - >
-      curl -s -D - http://127.0.0.1:80/ml -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled" && echo "PASS: ml"
+      curl -s -D - http://127.0.0.1:80/ml_async -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled" && echo "PASS: ml"
+
+    - >
+      curl -s -D - http://127.0.0.1:80/ml_sync -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled" && echo "PASS: ml"
 
     - |
       if curl -s -D - http://127.0.0.1:80/no_ml -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled"; then
