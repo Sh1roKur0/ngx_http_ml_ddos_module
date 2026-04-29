@@ -332,16 +332,34 @@ static char *ngx_http_ml_ddos_enable(ngx_conf_t *cf, ngx_command_t *cmd,
 /// ===== HANDLER =====
 
 typedef struct {
-    float features[7];
     float block_threshold;
     float limit_threshold;
     ngx_http_request_t *r;
     ngx_int_t rc;
 } ngx_http_ml_ddos_task_ctx_t;
 
-static void ngx_http_ml_ddos_inference_thread(void *data, ngx_log_t *log) {
+static void ngx_http_ml_ddos_worker(void *data, ngx_log_t *log) {
     ngx_http_ml_ddos_task_ctx_t *ctx = data;
-    log = ctx->r->connection->log;
+    ngx_http_request_t *r = ctx->r;
+    log = r->connection->log;
+
+    float intensity = (float)r->connection->requests;
+    float request_length = (float)r->request_length;
+    float url_length = (float)r->request_line.len;
+    float args_length = (float)r->args.len + !!r->args.len;
+    float ua_length = r->headers_in.user_agent
+                          ? (float)r->headers_in.user_agent->value.len
+                          : 0.0f;
+
+    ngx_time_t *tp = ngx_timeofday();
+    ngx_msec_t ms =
+        (tp->sec - r->start_sec) * 1000 + (tp->msec - r->start_msec);
+    float request_time = ms > 0 ? (float)ms / 1000.0f : 0.0f;
+
+    float special_chars = 0.0f;
+    for (size_t i = 0; i < r->args.len; i++)
+        if (!isalnum((unsigned char)r->args.data[i]))
+            special_chars++;
 
 #if NGX_DEBUG
     ngx_log_error(NGX_LOG_NOTICE, log, NGX_OK,
@@ -353,10 +371,18 @@ static void ngx_http_ml_ddos_inference_thread(void *data, ngx_log_t *log) {
                              "\targs_length:\t%f\n"
                              "\tspecial_chars:\t%f\n"
                              "\tua_length:\t%f",
-                  ctx->features[0], ctx->features[1], ctx->features[2],
-                  ctx->features[3], ctx->features[4], ctx->features[5],
-                  ctx->features[6]);
+                  intensity, request_length, request_time, url_length,
+                  args_length, special_chars, ua_length);
 #endif
+
+    float features[7];
+    features[0] = intensity;
+    features[1] = request_length;
+    features[2] = request_time;
+    features[3] = url_length;
+    features[4] = args_length;
+    features[5] = special_chars;
+    features[6] = ua_length;
 
     OrtStatus *status = NULL;
 #define ONNX_ASSERT(expr)      \
@@ -368,7 +394,7 @@ static void ngx_http_ml_ddos_inference_thread(void *data, ngx_log_t *log) {
     int64_t dims[2] = {1, 7};
     OrtValue *input_tensor = NULL;
     ONNX_ASSERT(ort_api->CreateTensorWithDataAsOrtValue(
-        ort_memory_info, ctx->features, sizeof(ctx->features), dims, 2,
+        ort_memory_info, features, sizeof(features), dims, 2,
         ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor));
 
     const char *input_names[] = {"features"};
@@ -438,7 +464,7 @@ done:
         ort_api->ReleaseValue(seq_elem);
 }
 
-static void ngx_http_ml_ddos_inference_done(ngx_event_t *ev) {
+static void ngx_http_ml_ddos_worker_done(ngx_event_t *ev) {
     ngx_http_ml_ddos_task_ctx_t *ctx = ev->data;
 
     if (ctx->rc == NGX_DECLINED)
@@ -479,35 +505,9 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
     ctx->limit_threshold = lcf->limit_threshold;
     ctx->r = r;
 
-    float intensity = (float)r->connection->requests;
-    float request_length = (float)r->request_length;
-    float url_length = (float)r->request_line.len;
-    float args_length = (float)r->args.len + !!r->args.len;
-    float ua_length = r->headers_in.user_agent
-                          ? (float)r->headers_in.user_agent->value.len
-                          : 0.0f;
-
-    ngx_time_t *tp = ngx_timeofday();
-    ngx_msec_t ms =
-        (tp->sec - r->start_sec) * 1000 + (tp->msec - r->start_msec);
-    float request_time = ms > 0 ? (float)ms / 1000.0f : 0.0f;
-
-    float special_chars = 0.0f;
-    for (size_t i = 0; i < r->args.len; i++)
-        if (!isalnum((unsigned char)r->args.data[i]))
-            special_chars++;
-
-    ctx->features[0] = intensity;
-    ctx->features[1] = request_length;
-    ctx->features[2] = request_time;
-    ctx->features[3] = url_length;
-    ctx->features[4] = args_length;
-    ctx->features[5] = special_chars;
-    ctx->features[6] = ua_length;
-
     if (lcf->thread_pool) {
-        task->handler = ngx_http_ml_ddos_inference_thread;
-        task->event.handler = ngx_http_ml_ddos_inference_done;
+        task->handler = ngx_http_ml_ddos_worker;
+        task->event.handler = ngx_http_ml_ddos_worker_done;
         task->event.data = ctx;
 
         ngx_int_t thread_status = ngx_thread_task_post(lcf->thread_pool, task);
@@ -520,7 +520,7 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
 
         return NGX_AGAIN;
     } else {
-        ngx_http_ml_ddos_inference_thread(ctx, r->connection->log);
+        ngx_http_ml_ddos_worker(ctx, r->connection->log);
         return ctx->rc;
     }
 }
