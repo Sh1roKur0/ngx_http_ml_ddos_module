@@ -303,7 +303,7 @@ static float parse_float(ngx_conf_t *cf, ngx_str_t *restrict param,
     ngx_str_t value = get_value(param, prefix);
 
     ngx_int_t v = ngx_atofp(value.data, value.len, 3);
-    if (v == NGX_ERROR || v <= 0 || v > 1000.0f) {
+    if (v == NGX_ERROR || v <= 0 || v > 1000) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            LOG_PREFIX "invalid %V value \"%V\"", prefix,
                            &value);
@@ -408,7 +408,7 @@ static void ngx_http_ml_ddos_worker(void *data, ngx_log_t *log) {
                   args_length, special_chars, ua_length);
 #endif
 
-    static _Thread_local float features[7];
+    float features[7];
     features[0] = intensity;
     features[1] = request_length;
     features[2] = request_time;
@@ -482,16 +482,16 @@ done:
         ctx->rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    if (input_tensor)
-        ort_api->ReleaseValue(input_tensor);
-    if (outputs[0])
-        ort_api->ReleaseValue(outputs[0]);
-    if (outputs[1])
-        ort_api->ReleaseValue(outputs[1]);
     if (tensor)
         ort_api->ReleaseValue(tensor);
     if (seq_elem)
         ort_api->ReleaseValue(seq_elem);
+    if (outputs[1])
+        ort_api->ReleaseValue(outputs[1]);
+    if (outputs[0])
+        ort_api->ReleaseValue(outputs[0]);
+    if (input_tensor)
+        ort_api->ReleaseValue(input_tensor);
 }
 
 static void ngx_http_ml_ddos_worker_done(ngx_event_t *ev) {
@@ -517,12 +517,11 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
                   lcf->thread_pool, lcf->block_threshold, lcf->limit_threshold);
 
     ngx_table_elt_t *h = ngx_list_push(&r->headers_out.headers);
-    if (!h)
-        return NGX_ERROR;
-
-    ngx_str_set(&h->key, "X-HTTP-ML-DDOS");
-    ngx_str_set(&h->value, "Enabled");
-    h->hash = 1;
+    if (h) {
+        ngx_str_set(&h->key, "X-HTTP-ML-DDOS");
+        ngx_str_set(&h->value, "Enabled");
+        h->hash = 1;
+    }
 #endif
 
     ngx_thread_task_t *task =
@@ -540,13 +539,14 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
         task->event.handler = ngx_http_ml_ddos_worker_done;
         task->event.data = ctx;
 
+        r->main->count++;
         ngx_int_t thread_status = ngx_thread_task_post(lcf->thread_pool, task);
         if (thread_status != NGX_OK) {
+            r->main->count--;
             ngx_log_error(NGX_LOG_ERR, r->connection->log, thread_status,
                           LOG_PREFIX "Failed to add a task to the thread pool");
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
-        r->main->count++;
 
         return NGX_AGAIN;
     } else {
