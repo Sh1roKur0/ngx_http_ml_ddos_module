@@ -165,9 +165,13 @@ static ngx_int_t ngx_http_ml_ddos_init_process(ngx_cycle_t *cycle) {
     if ((status = (expr)))     \
         goto err;
 
-    ONNX_ASSERT(
-        ort_api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "ngx_ml_ddos", &ort_env),
-        error_env);
+#if NGX_DEBUG
+#    define ONNX_LOG_LEVEL ORT_LOGGING_LEVEL_VERBOSE
+#else
+#    define ONNX_LOG_LEVEL ORT_LOGGING_LEVEL_ERROR
+#endif
+    ONNX_ASSERT(ort_api->CreateEnv(ONNX_LOG_LEVEL, "ngx_ml_ddos", &ort_env),
+                error_env);
 
     ONNX_ASSERT(ort_api->CreateSessionOptions(&ort_session_options),
                 error_options);
@@ -394,7 +398,7 @@ static void ngx_http_ml_ddos_worker(void *data, ngx_log_t *log) {
                   args_length, special_chars, ua_length);
 #endif
 
-    float features[7];
+    static _Thread_local float features[7];
     features[0] = intensity;
     features[1] = request_length;
     features[2] = request_time;
