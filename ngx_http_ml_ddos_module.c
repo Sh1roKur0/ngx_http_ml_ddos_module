@@ -278,6 +278,41 @@ static char *ngx_http_ml_ddos_path(ngx_conf_t *cf, ngx_command_t *cmd,
     return NGX_CONF_OK;
 }
 
+static inline ngx_str_t get_value(ngx_str_t *restrict value,
+                                  const ngx_str_t *prefix) {
+    ngx_str_t result;
+    result.len = value->len - prefix->len;
+    result.data = value->data + prefix->len;
+    return result;
+}
+
+static ngx_thread_pool_t *parse_thread_pool(ngx_conf_t *cf,
+                                            ngx_str_t *restrict param,
+                                            const ngx_str_t *prefix) {
+    ngx_str_t name = get_value(param, prefix);
+    ngx_thread_pool_t *tpool = ngx_thread_pool_add(cf, &name);
+    if (!tpool) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, NGX_ERROR,
+                           LOG_PREFIX "invalid thread pool \"%V\"", &name);
+    }
+    return tpool;
+}
+
+static float parse_float(ngx_conf_t *cf, ngx_str_t *restrict param,
+                         const ngx_str_t *prefix) {
+    ngx_str_t value = get_value(param, prefix);
+
+    ngx_int_t v = ngx_atofp(value.data, value.len, 3);
+    if (v == NGX_ERROR || v <= 0 || v > 1000.0f) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           LOG_PREFIX "invalid %V value \"%V\"", prefix,
+                           &value);
+        return NAN;
+    }
+
+    return v / 1000.0f;
+}
+
 static char *ngx_http_ml_ddos_enable(ngx_conf_t *cf, ngx_command_t *cmd,
                                      void *conf) {
     ngx_http_ml_ddos_loc_conf_t *lcf = conf;
@@ -295,44 +330,21 @@ static char *ngx_http_ml_ddos_enable(ngx_conf_t *cf, ngx_command_t *cmd,
     static const ngx_str_t block_str = ngx_string("block=");
     static const ngx_str_t limit_str = ngx_string("limit=");
 
-#define GET_NAME(str)                   \
-    ngx_str_t name;                     \
-    name.len = value[i].len - str.len;  \
-    name.data = value[i].data + str.len
-
     for (ngx_uint_t i = 2; i < cf->args->nelts; i++) {
         if (ngx_strncmp(value[i].data, thread_str.data, thread_str.len) == 0) {
-            GET_NAME(thread_str);
-
-            lcf->thread_pool = ngx_thread_pool_add(cf, &name);
-            if (lcf->thread_pool == NULL) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, NGX_ERROR,
-                                   LOG_PREFIX "invalid thread pool \"%V\"",
-                                   &name);
+            lcf->thread_pool = parse_thread_pool(cf, &value[i], &thread_str);
+            if (!lcf->thread_pool)
                 return NGX_CONF_ERROR;
-            }
         } else if (ngx_strncmp(value[i].data, block_str.data, block_str.len) ==
                    0) {
-            GET_NAME(block_str);
-            ngx_int_t v = ngx_atofp(name.data, name.len, 3);
-            if (v == NGX_ERROR || v <= 0) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   LOG_PREFIX "invalid block value \"%V\"",
-                                   &value[i]);
+            lcf->block_threshold = parse_float(cf, &value[i], &block_str);
+            if (isnan(lcf->block_threshold))
                 return NGX_CONF_ERROR;
-            }
-            lcf->block_threshold = v / 1000.0f;
         } else if (ngx_strncmp(value[i].data, limit_str.data, limit_str.len) ==
                    0) {
-            GET_NAME(limit_str);
-            ngx_int_t v = ngx_atofp(name.data, name.len, 3);
-            if (v == NGX_ERROR || v <= 0) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   LOG_PREFIX "invalid limit value \"%V\"",
-                                   &value[i]);
+            lcf->limit_threshold = parse_float(cf, &value[i], &limit_str);
+            if (isnan(lcf->limit_threshold))
                 return NGX_CONF_ERROR;
-            }
-            lcf->limit_threshold = v / 1000.0f;
         } else {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, NGX_ERROR,
                                LOG_PREFIX "unknown parameter \"%V\"",
@@ -346,8 +358,6 @@ static char *ngx_http_ml_ddos_enable(ngx_conf_t *cf, ngx_command_t *cmd,
                            LOG_PREFIX "limit must be less than block");
         return NGX_CONF_ERROR;
     }
-
-#undef GET_NAME
 
     return NGX_CONF_OK;
 }
@@ -444,9 +454,8 @@ static void ngx_http_ml_ddos_worker(void *data, ngx_log_t *log) {
     OrtValue *seq_elem = NULL;
     ONNX_ASSERT(ort_api->GetValue(outputs[1], 0, ort_allocator, &seq_elem));
 
-    int64_t key = 1;
     OrtValue *tensor = NULL;
-    ONNX_ASSERT(ort_api->GetValue(seq_elem, key, ort_allocator, &tensor));
+    ONNX_ASSERT(ort_api->GetValue(seq_elem, 1, ort_allocator, &tensor));
 
     float *probs = NULL;
     ONNX_ASSERT(ort_api->GetTensorMutableData(tensor, (void **)&probs));
