@@ -294,7 +294,7 @@ static char *ngx_http_ml_ddos_enable(ngx_conf_t *cf, ngx_command_t *cmd,
             ngx_int_t v = ngx_atofp(name.data, name.len, 3);
             if (v == NGX_ERROR || v <= 0) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   LOG_PREFIX "invalid limit value \"%V\"",
+                                   LOG_PREFIX "invalid block value \"%V\"",
                                    &value[i]);
                 return NGX_CONF_ERROR;
             }
