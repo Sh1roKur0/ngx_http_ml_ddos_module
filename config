@@ -12,7 +12,15 @@ if pkg-config --exists libonnxruntime; then
     ORT_LIBS="$(pkg-config --libs libonnxruntime)"
 fi
 
-ngx_module_incs="$ORT_INC_DIR"
-ngx_module_libs="$ORT_LIBS"
+XXHASH_INC_DIR=""
+XXHASH_LIBS="-lxxhash"
+
+if pkg-config --exists libxxhash; then
+    XXHASH_INC_DIR="$(pkg-config --cflags-only-I libxxhash | sed 's/-I//g')"
+    XXHASH_LIBS="$(pkg-config --libs libxxhash)"
+fi
+
+ngx_module_incs="$ORT_INC_DIR $XXHASH_INC_DIR"
+ngx_module_libs="$ORT_LIBS $XXHASH_LIBS"
 
 . auto/module

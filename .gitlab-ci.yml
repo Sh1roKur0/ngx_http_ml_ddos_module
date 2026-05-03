@@ -35,7 +35,8 @@ build:
         ca-certificates \
         libpcre2-dev \
         zlib1g-dev \
-        libssl-dev
+        libssl-dev \
+        libxxhash-dev
 
     # ONNX Runtime
     - |
@@ -55,7 +56,7 @@ build:
       export NGINX_VERSION=$(apt-cache show nginx \
         | grep -m1 '^Version:' \
         | grep -oP '\d+\.\d+\.\d+')
-    - curl -LO http://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz  
+    - curl -LO http://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz
     - tar -xzf nginx-${NGINX_VERSION}.tar.gz
     - mv nginx-${NGINX_VERSION} nginx
 
@@ -79,7 +80,7 @@ test:
     - build
   before_script:
     - !reference [.apt_setup, before_script]
-    - apt-get install -y curl ca-certificates nginx locales
+    - apt-get install -y curl ca-certificates nginx locales libxxhash-dev
 
     - locale-gen en_US.UTF-8
     - export LANG=en_US.utf8
@@ -138,7 +139,7 @@ test:
       EOF
   script:
     - nginx -v
-    - nginx -t 
+    - nginx -t
     - nginx
 
     - |

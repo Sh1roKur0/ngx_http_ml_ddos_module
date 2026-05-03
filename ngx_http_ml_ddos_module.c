@@ -1,9 +1,10 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 #include <ngx_thread_pool.h>
-#include <onnxruntime_c_api.h>
 
-#include <ctype.h>
+#include <onnxruntime_c_api.h>
+#include <xxhash.h>
+
 #include <math.h>
 
 #define LOG_PREFIX "ML_DDOS: "
@@ -20,6 +21,11 @@
 #else
 #    define NGX_ASSERT(...)
 #endif
+
+#define XXH_SEED 0x694201337671488
+#define NGX_STR_HASH(str) (XXH64(str.data, str.len, XXH_SEED))
+#define NGX_ELT_HASH(elt) (elt ? NGX_STR_HASH(elt->value) : 0)
+#define NGX_HDR_HASH(r, hdr) NGX_ELT_HASH(r->headers_in.hdr)
 
 typedef struct {
     ngx_str_t model_path;
@@ -371,96 +377,100 @@ typedef struct {
     ngx_int_t rc;
 } ngx_http_ml_ddos_task_ctx_t;
 
+static ngx_inline uint64_t get_header_count(ngx_http_request_t *const r) {
+    uint64_t result = 0;
+
+    ngx_list_part_t *part = &r->headers_in.headers.part;
+    while (part) {
+        result += part->nelts;
+        part = part->next;
+    }
+
+    return result;
+}
+
 static void ngx_http_ml_ddos_worker(void *data, ngx_log_t *log) {
     ngx_http_ml_ddos_task_ctx_t *ctx = data;
     ngx_http_request_t *r = ctx->r;
     log = r->connection->log;
 
-    float intensity = (float)r->connection->requests;
-    float request_length = (float)r->request_length;
-    float url_length = (float)r->request_line.len;
-    float args_length = (float)r->args.len + !!r->args.len;
-    float ua_length = r->headers_in.user_agent
-                          ? (float)r->headers_in.user_agent->value.len
-                          : 0.0f;
+    uint64_t features[15];
+    size_t i = 0;
 
-    ngx_time_t *tp = ngx_timeofday();
-    ngx_msec_t ms =
-        (tp->sec - r->start_sec) * 1000 + (tp->msec - r->start_msec);
-    float request_time = ms > 0 ? (float)ms / 1000.0f : 0.0f;
-
-    float special_chars = 0.0f;
-    for (size_t i = 0; i < r->args.len; i++)
-        if (!isalnum((unsigned char)r->args.data[i]))
-            special_chars++;
+    features[i++] = r->method;
+    features[i++] = r->uri.len;
+    features[i++] = r->args.len;
+    features[i++] = NGX_STR_HASH(r->uri);
+    features[i++] = NGX_HDR_HASH(r, user_agent);
+    features[i++] = NGX_HDR_HASH(r, accept_encoding);
+    features[i++] = NGX_HDR_HASH(r, content_type);
+#if (nginx_version >= 1023000)
+    features[i++] = NGX_HDR_HASH(r, cookie);
+#else
+    features[i++] =
+        r->headers_in.cookies.nelts
+            ? NGX_ELT_HASH(((ngx_table_elt_t **)r->headers_in.cookies.elts)[0])
+            : 0;
+#endif
+    features[i++] = r->headers_in.content_length_n > 0
+                        ? (uint64_t)r->headers_in.content_length_n
+                        : 0;
+    features[i++] = NGX_HDR_HASH(r, host);
+    features[i++] = get_header_count(r);
+    features[i++] = NGX_HDR_HASH(r, connection);
+    features[i++] = r->http_version;
+    features[i++] = NGX_STR_HASH(r->connection->addr_text);
+    features[i++] = r->connection->requests;
 
 #if NGX_DEBUG
-    ngx_log_error(NGX_LOG_NOTICE, log, NGX_OK,
-                  LOG_PREFIX "PARAMS:\n"
-                             "\tintensivity:\t%f\n"
-                             "\trequest_length:\t%f\n"
-                             "\trequest_time:\t%.6f\n"
-                             "\turl_length:\t%f\n"
-                             "\targs_length:\t%f\n"
-                             "\tspecial_chars:\t%f\n"
-                             "\tua_length:\t%f",
-                  intensity, request_length, request_time, url_length,
-                  args_length, special_chars, ua_length);
+    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
+                  "features: {\n"
+                  "\t\"method\": %ui,\n"
+                  "\t\"uri_length\": %ui,\n"
+                  "\t\"args_length\": %ui,\n"
+                  "\t\"uri_hash\": \"%016xL\",\n"
+                  "\t\"user_agent\": \"%016xL\",\n"
+                  "\t\"accept_encoding\": \"%016xL\",\n"
+                  "\t\"content_type\": \"%016xL\",\n"
+                  "\t\"cookie\": \"%016xL\",\n"
+                  "\t\"content_length\": %ui,\n"
+                  "\t\"host\": \"%016xL\",\n"
+                  "\t\"header_count\": %ui,\n"
+                  "\t\"connection\": \"%016xL\",\n"
+                  "\t\"http_version\": %ui,\n"
+                  "\t\"client_addr\": \"%016xL\",\n"
+                  "\t\"request_count\": %ui\n"
+                  "}",
+                  features[0], features[1], features[2], features[3],
+                  features[4], features[5], features[6], features[7],
+                  features[8], features[9], features[10], features[11],
+                  features[12], features[13], features[14]);
 #endif
 
-    float features[7];
-    features[0] = intensity;
-    features[1] = request_length;
-    features[2] = request_time;
-    features[3] = url_length;
-    features[4] = args_length;
-    features[5] = special_chars;
-    features[6] = ua_length;
-
     OrtStatus *status = NULL;
-#define ONNX_ASSERT(expr)  \
-    if ((status = (expr))) \
-        goto done;
+#define ONNX_ASSERT(expr)      \
+    do {                       \
+        if ((status = (expr))) \
+            goto done;         \
+    } while (0)
 
-    int64_t dims[2] = {1, 7};
+    int64_t dims[3] = {1, 15, 1};
     OrtValue *input_tensor = NULL;
     ONNX_ASSERT(ort_api->CreateTensorWithDataAsOrtValue(
-        ort_memory_info, features, sizeof(features), dims, 2,
-        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor));
+        ort_memory_info, features, sizeof(features), dims, 3,
+        ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64, &input_tensor));
 
-    const char *input_names[] = {"features"};
-    const char *output_names[] = {"label", "probabilities"};
+    const char *input_names[] = {"input"};
+    const char *output_names[] = {"output"};
 
-    OrtValue *outputs[2] = {NULL, NULL};
+    OrtValue *outputs = NULL;
     ONNX_ASSERT(ort_api->Run(ort_session, NULL, input_names,
                              (const OrtValue *const *)&input_tensor, 1,
-                             output_names, 2, outputs));
-
-    ONNXType out_type;
-    ONNX_ASSERT(ort_api->GetValueType(outputs[1], &out_type));
-
-    if (out_type != ONNX_TYPE_SEQUENCE) {
-        ctx->rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
-        goto done;
-    }
-
-    size_t seq_len = 0;
-    ONNX_ASSERT(ort_api->GetValueCount(outputs[1], &seq_len));
-    if (seq_len == 0) {
-        ctx->rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
-        goto done;
-    }
-
-    OrtValue *seq_elem = NULL;
-    ONNX_ASSERT(ort_api->GetValue(outputs[1], 0, ort_allocator, &seq_elem));
-
-    OrtValue *tensor = NULL;
-    ONNX_ASSERT(ort_api->GetValue(seq_elem, 1, ort_allocator, &tensor));
+                             output_names, 1, &outputs));
 
     float *probs = NULL;
-    ONNX_ASSERT(ort_api->GetTensorMutableData(tensor, (void **)&probs));
-
-    float attack_prob = probs[1];
+    ONNX_ASSERT(ort_api->GetTensorMutableData(outputs, (void **)&probs));
+    float attack_prob = probs[0];
 
 #if NGX_DEBUG
     ngx_log_error(NGX_LOG_NOTICE, log, NGX_OK,
@@ -482,14 +492,8 @@ done:
         ctx->rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    if (tensor)
-        ort_api->ReleaseValue(tensor);
-    if (seq_elem)
-        ort_api->ReleaseValue(seq_elem);
-    if (outputs[1])
-        ort_api->ReleaseValue(outputs[1]);
-    if (outputs[0])
-        ort_api->ReleaseValue(outputs[0]);
+    if (outputs)
+        ort_api->ReleaseValue(outputs);
     if (input_tensor)
         ort_api->ReleaseValue(input_tensor);
 }
