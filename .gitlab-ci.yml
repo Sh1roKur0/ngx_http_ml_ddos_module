@@ -2,69 +2,40 @@ stages:
   - build
   - test
 
-image: debian:12-slim
+image: debian:trixie-slim
 
-variables:
-  ONNX_VERSION: "1.17.3"
-
-.apt_setup:
-  before_script:
-    - rm -f /etc/apt/sources.list
-    - rm -rf /etc/apt/sources.list.d/*
-    - echo "deb http://mirror.selectel.ru/debian bookworm main contrib non-free non-free-firmware" > /etc/apt/sources.list
-    - echo "deb http://mirror.selectel.ru/debian bookworm-updates main contrib non-free non-free-firmware" >> /etc/apt/sources.list
-    - apt-get update
-
-default:
-  cache:
-    - key: onnxruntime-${ONNX_VERSION}
-      paths:
-        - onnxruntime.tgz
-        - onnxruntime-linux-x64-${ONNX_VERSION}/
+.apt_setup: &apt_setup
+  - rm -f /etc/apt/sources.list
+  - rm -rf /etc/apt/sources.list.d/*
+  - echo "deb http://mirror.selectel.ru/debian trixie main contrib non-free non-free-firmware" > /etc/apt/sources.list
+  - echo "deb-src http://mirror.selectel.ru/debian trixie main" >> /etc/apt/sources.list
+  - apt-get update
+  - apt-get dist-upgrade -y
+  - apt-get install -y ca-certificates
 
 build:
   stage: build
   before_script:
-    - !reference [.apt_setup, before_script]
+    - *apt_setup
     - |
-      apt-get install -y \
-        build-essential \
+      apt-get install -y --allow-downgrades \
         pkg-config \
-        curl \
-        git \
-        ca-certificates \
+        build-essential \
         libpcre2-dev \
         zlib1g-dev \
-        libssl-dev
+        libssl3t64=3.5.5-1~deb13u1 \
+        libssl-dev \
+        nginx \
+        libonnxruntime-dev
 
-    # ONNX Runtime
-    - |
-      if [ ! -f onnxruntime.tgz ]; then
-        curl -L -o onnxruntime.tgz \
-          https://github.com/microsoft/onnxruntime/releases/download/v${ONNX_VERSION}/onnxruntime-linux-x64-${ONNX_VERSION}.tgz
-      fi
-    - |
-      if [ ! -d onnxruntime-linux-x64-${ONNX_VERSION} ]; then
-        tar -xzf onnxruntime.tgz
-      fi
-    - cp -r onnxruntime-linux-x64-${ONNX_VERSION}/include/* /usr/local/include/
-    - cp -r onnxruntime-linux-x64-${ONNX_VERSION}/lib/* /usr/local/lib/
-    - ldconfig
-
-    - |
-      export NGINX_VERSION=$(apt-cache show nginx \
-        | grep -m1 '^Version:' \
-        | grep -oP '\d+\.\d+\.\d+')
-    - curl -LO http://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz  
-    - tar -xzf nginx-${NGINX_VERSION}.tar.gz
-    - mv nginx-${NGINX_VERSION} nginx
+    - apt-get source nginx
+    - mv nginx-* nginx
 
   script:
     - cd nginx
     - |
       ./configure \
       --add-dynamic-module=.. \
-      --with-ld-opt="-Wl,-rpath,/usr/local/lib" \
       --with-compat \
       --with-debug
     - make modules
@@ -78,16 +49,8 @@ test:
   dependencies:
     - build
   before_script:
-    - !reference [.apt_setup, before_script]
-    - apt-get install -y curl ca-certificates nginx locales
-
-    - locale-gen en_US.UTF-8
-    - export LANG=en_US.utf8
-    - export LC_ALL=en_US.utf8
-
-    - cp -r onnxruntime-linux-x64-${ONNX_VERSION}/lib/* /usr/local/lib/
-    - export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
-    - ldconfig
+    - *apt_setup
+    - apt-get install -y curl nginx libonnxruntime-dev
 
     - cp model.onnx /etc/nginx/model.onnx
 
