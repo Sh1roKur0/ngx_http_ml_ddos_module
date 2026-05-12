@@ -661,6 +661,7 @@ static ngx_inline uint32_t uint32_overflow_max(uint64_t a) {
 
 typedef struct {
     ngx_http_ml_ddos_main_conf_t *mcf;
+    mlds_features_t *features_matrix;
     float block_threshold;
     float limit_threshold;
     ngx_http_request_t *r;
@@ -673,48 +674,6 @@ static void ngx_http_ml_ddos_worker(void *data, ngx_log_t *log) {
     ngx_http_request_t *r = ctx->r;
     log = r->connection->log;
 
-    ngx_slab_pool_t *shpool = (ngx_slab_pool_t *)mcf->shm_buffer->shm.addr;
-    mlds_buffer_t *buffer = mcf->shm_buffer->data;
-
-    mlds_metadata_t meta;
-    meta.timestamp = get_current_nanos();
-    meta.uid = get_client_ipv4_as_uint32(r);
-
-    mlds_features_t features;
-    mlds_features_params_t *params = &features.params;
-    mlds_features_flags_t *flags = &params->flags;
-
-    parse_params(r, params);
-    parse_flags(r, flags);
-
-    ngx_shmtx_lock(&shpool->mutex);
-
-    params->ns_delta =
-        uint32_overflow_max(meta.timestamp - shm_buffer_last_timestamp(buffer));
-    params->ip_request_count = shm_buffer_uid_count(buffer, meta.uid);
-
-    shm_buffer_push_element(buffer, &features, &meta);
-    mlds_features_t *features_matrix =
-        shm_buffer_features_dump(buffer, r->pool);
-
-    ngx_shmtx_unlock(&shpool->mutex);
-
-#if NGX_DEBUG
-    ngx_log_error(NGX_LOG_NOTICE, log, NGX_OK,
-                  LOG_PREFIX "features:\n"
-                             "\tns_delta: %ul\n"
-                             "\tip_request_count: %ul\n"
-                             "\turi_length: %ul\n"
-                             "\targs_length: %ul\n"
-                             "\theader_count: %ul\n"
-                             "\tcontent_length: %ul\n"
-                             "\tconnection_requests: %ul\n"
-                             "\tflags: %ul",
-                  features.data[0], features.data[1], features.data[2],
-                  features.data[3], features.data[4], features.data[5],
-                  features.data[6], features.data[7]);
-#endif
-
     OrtStatus *status = NULL;
 #define ONNX_ASSERT(expr)  \
     if ((status = (expr))) \
@@ -723,8 +682,9 @@ static void ngx_http_ml_ddos_worker(void *data, ngx_log_t *log) {
     int64_t dims[3] = {1, NGX_HTTP_ML_DDOS_BUFFER_SIZE, 8};
     OrtValue *input_tensor = NULL;
     ONNX_ASSERT(mcf->ort_api->CreateTensorWithDataAsOrtValue(
-        mcf->ort_memory_info, features_matrix, sizeof(buffer->features), dims,
-        3, ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32, &input_tensor));
+        mcf->ort_memory_info, ctx->features_matrix,
+        sizeof(*ctx->features_matrix) * NGX_HTTP_ML_DDOS_BUFFER_SIZE, dims, 3,
+        ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32, &input_tensor));
 
     const char *input_names[] = {"input"};
     const char *output_names[] = {"output"};
@@ -758,6 +718,8 @@ done:
         ctx->rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
+    if (outputs)
+        mcf->ort_api->ReleaseValue(outputs);
     if (input_tensor)
         mcf->ort_api->ReleaseValue(input_tensor);
 
@@ -802,8 +764,54 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
     if (!task)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
 
+    ngx_slab_pool_t *shpool = (ngx_slab_pool_t *)mcf->shm_buffer->shm.addr;
+    mlds_buffer_t *buffer = mcf->shm_buffer->data;
+
+    mlds_metadata_t meta;
+    meta.timestamp = get_current_nanos();
+    meta.uid = get_client_ipv4_as_uint32(r);
+
+    mlds_features_t features;
+    mlds_features_params_t *params = &features.params;
+    mlds_features_flags_t *flags = &params->flags;
+
+    parse_params(r, params);
+    parse_flags(r, flags);
+
+    ngx_shmtx_lock(&shpool->mutex);
+
+    params->ns_delta =
+        uint32_overflow_max(meta.timestamp - shm_buffer_last_timestamp(buffer));
+    params->ip_request_count = shm_buffer_uid_count(buffer, meta.uid);
+
+    shm_buffer_push_element(buffer, &features, &meta);
+    mlds_features_t *features_matrix =
+        shm_buffer_features_dump(buffer, r->pool);
+
+    ngx_shmtx_unlock(&shpool->mutex);
+
+    if (!features_matrix)
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+
+#if NGX_DEBUG
+    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, NGX_OK,
+                  LOG_PREFIX "features:\n"
+                             "\tns_delta: %ul\n"
+                             "\tip_request_count: %ul\n"
+                             "\turi_length: %ul\n"
+                             "\targs_length: %ul\n"
+                             "\theader_count: %ul\n"
+                             "\tcontent_length: %ul\n"
+                             "\tconnection_requests: %ul\n"
+                             "\tflags: %ul",
+                  features.data[0], features.data[1], features.data[2],
+                  features.data[3], features.data[4], features.data[5],
+                  features.data[6], features.data[7]);
+#endif
+
     ngx_http_ml_ddos_task_ctx_t *ctx = task->ctx;
     ctx->mcf = mcf;
+    ctx->features_matrix = features_matrix;
     ctx->block_threshold = lcf->block_threshold;
     ctx->limit_threshold = lcf->limit_threshold;
     ctx->r = r;
