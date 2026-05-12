@@ -131,6 +131,25 @@ static char *ngx_http_ml_ddos_merge_loc_conf(ngx_conf_t *cf, void *parent,
 
 /// ===== PROCESS ======
 
+/**
+ * Initializes ONNX model with specific session options:
+ *
+ * Threading:
+ * 1. Intra-op threads: 0 (because we use internal nginx thread pool)
+ * 2. Inter-op threads: 0 (same reason)
+ * 3. Execution mode: SEQUENTIAL (same reason)
+ * 4. Spinning Behavior: 1 (use all CPU it can)
+ *
+ * Graph optimization level:
+ * 1. Graph optimization: DISABLE_ALL (for small models it can be slower)
+ *
+ * Memory managment:
+ * 1. Memory pattern: 1 (we use same size of input each time)
+ * 2. Arena allocator: 1 (more efficient than casual allocations)
+ *
+ * Logging:
+ * 1. Log level and profiling: depends on NGX_DEBUG
+ */
 static ngx_int_t ngx_http_ml_ddos_init_process(ngx_cycle_t *cycle) {
     ngx_http_ml_ddos_main_conf_t *mcf =
         ngx_http_cycle_get_module_main_conf(cycle, ngx_http_ml_ddos_module);
@@ -184,6 +203,10 @@ static ngx_int_t ngx_http_ml_ddos_init_process(ngx_cycle_t *cycle) {
     ONNX_ASSERT(mcf->ort_api->SetSessionExecutionMode(mcf->ort_session_options,
                                                       ORT_SEQUENTIAL),
                 error_options);
+    ONNX_ASSERT(
+        mcf->ort_api->AddSessionConfigEntry(
+            mcf->ort_session_options, "session.intra_op.allow_spinning", "1"),
+        error_options);
 
     ONNX_ASSERT(mcf->ort_api->EnableMemPattern(mcf->ort_session_options),
                 error_options);
@@ -252,17 +275,17 @@ static void ngx_http_ml_ddos_exit_process(ngx_cycle_t *cycle) {
 #define NGX_HTTP_ML_DDOS_BUFFER_SIZE 1024
 #define NGX_HTTP_ML_DDOS_TABLE_SIZE (NGX_HTTP_ML_DDOS_BUFFER_SIZE * 4)
 
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 _Static_assert(NGX_HTTP_ML_DDOS_BUFFER_SIZE <= 65535,
                "Buffer size must not exceed uint16_t max capacity (65535)");
 
-#    define POWER_OF_2_CHECK(n)                               \
-        _Static_assert(((n) > 0) && (((n) & ((n) - 1))) == 0, \
-                       #n " size must be a power of two!")
+#define POWER_OF_2_CHECK(n)                               \
+    _Static_assert(((n) > 0) && (((n) & ((n) - 1))) == 0, \
+                   #n " size must be a power of two!")
 
 POWER_OF_2_CHECK(NGX_HTTP_ML_DDOS_BUFFER_SIZE);
 POWER_OF_2_CHECK(NGX_HTTP_ML_DDOS_TABLE_SIZE);
-#endif
+
+#define NGX_HTTP_ML_DDOS_BUFFER_LIMIT(n, buffer) ((n) & (buffer - 1))
 
 typedef struct ngx_http_ml_ddos_features_flags {
     uint32_t http_version : 2;
@@ -369,7 +392,7 @@ static ngx_inline uint32_t hash_uint32(uint32_t key) {
     key ^= key >> 13;
     key *= 0xc2b2ae35;
     key ^= key >> 16;
-    return key & (NGX_HTTP_ML_DDOS_TABLE_SIZE - 1);
+    return NGX_HTTP_ML_DDOS_BUFFER_LIMIT(key, NGX_HTTP_ML_DDOS_TABLE_SIZE);
 }
 
 static ngx_inline uint64_t shm_buffer_last_timestamp(mlds_buffer_t *buffer) {
@@ -385,8 +408,8 @@ static ngx_inline uint16_t shm_buffer_uid_count(mlds_buffer_t *buffer,
 static ngx_inline void shm_buffer_push_element(mlds_buffer_t *buffer,
                                                mlds_features_t *features,
                                                mlds_metadata_t *meta) {
-    buffer->tail_idx =
-        (buffer->tail_idx + 1) & (NGX_HTTP_ML_DDOS_BUFFER_SIZE - 1);
+    buffer->tail_idx = NGX_HTTP_ML_DDOS_BUFFER_LIMIT(
+        buffer->tail_idx + 1, NGX_HTTP_ML_DDOS_BUFFER_SIZE);
 
     uint32_t old_hash = hash_uint32(buffer->meta[buffer->tail_idx].uid);
     if (buffer->uid_table[old_hash] > 0)
@@ -409,10 +432,9 @@ static ngx_inline void shm_buffer_push_element(mlds_buffer_t *buffer,
  * ^                              ^                                  ^
  * features                    tail_idx                        BUFFER_SIZE
  */
-mlds_features_t *shm_buffer_features_dump(mlds_buffer_t *buffer,
-                                          ngx_pool_t *pool) {
-    mlds_features_t *features =
-        ngx_palloc(pool, sizeof(*features) * NGX_HTTP_ML_DDOS_BUFFER_SIZE);
+static ngx_inline mlds_features_t *
+shm_buffer_features_dump(mlds_buffer_t *buffer, ngx_pool_t *pool) {
+    mlds_features_t *features = ngx_palloc(pool, sizeof(buffer->features));
     if (!features)
         return NULL;
 
@@ -627,28 +649,24 @@ static ngx_inline void parse_flags(ngx_http_request_t *r,
 
 static uint32_t get_client_ipv4_as_uint32(ngx_http_request_t *r) {
     struct sockaddr *sockaddr = r->connection->sockaddr;
-    u_char *p;
     uint32_t ipv4 = 0;
 
+    struct sockaddr_in *sin;
+    struct sockaddr_in6 *sin6;
     switch (sockaddr->sa_family) {
-    case AF_INET: {
-        struct sockaddr_in *sin = (struct sockaddr_in *)sockaddr;
+    case AF_INET:
+        sin = (struct sockaddr_in *)sockaddr;
         ipv4 = ntohl(sin->sin_addr.s_addr);
         break;
-    }
-    case AF_INET6: {
-        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sockaddr;
-
-        static const unsigned char ipv4_mapped_prefix[12] = {
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
-
-        if (memcmp(sin6->sin6_addr.s6_addr, ipv4_mapped_prefix, 12) == 0) {
-            p = sin6->sin6_addr.s6_addr;
-            ipv4 = (p[12] << 24) | (p[13] << 16) | (p[14] << 8) | p[15];
+    case AF_INET6:
+        sin6 = (struct sockaddr_in6 *)sockaddr;
+        if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) {
+            ngx_memcpy(&ipv4, &sin6->sin6_addr.s6_addr[12], 4);
             ipv4 = ntohl(ipv4);
+        } else {
+            ipv4 = (uint32_t)ngx_murmur_hash2(sin6->sin6_addr.s6_addr, 16);
         }
         break;
-    }
     }
 
     return ipv4;
@@ -659,17 +677,16 @@ static ngx_inline uint32_t uint32_overflow_max(uint64_t a) {
     return a > UINT32_MAX ? UINT32_MAX : (uint32_t)a;
 }
 
-typedef struct {
+typedef struct ngx_http_ml_ddos_task_ctx {
     ngx_http_ml_ddos_main_conf_t *mcf;
+    ngx_http_ml_ddos_loc_conf_t *lcf;
     mlds_features_t *features_matrix;
-    float block_threshold;
-    float limit_threshold;
     ngx_http_request_t *r;
     ngx_int_t rc;
-} ngx_http_ml_ddos_task_ctx_t;
+} mlds_task_ctx_t;
 
 static void ngx_http_ml_ddos_worker(void *data, ngx_log_t *log) {
-    ngx_http_ml_ddos_task_ctx_t *ctx = data;
+    mlds_task_ctx_t *ctx = data;
     ngx_http_ml_ddos_main_conf_t *mcf = ctx->mcf;
     ngx_http_request_t *r = ctx->r;
     log = r->connection->log;
@@ -703,9 +720,9 @@ static void ngx_http_ml_ddos_worker(void *data, ngx_log_t *log) {
                   LOG_PREFIX "DDOS probability: %.6f", attack_prob);
 #endif
 
-    if (attack_prob > ctx->block_threshold)
+    if (attack_prob > ctx->lcf->block_threshold)
         ctx->rc = NGX_HTTP_FORBIDDEN;
-    else if (attack_prob > ctx->limit_threshold)
+    else if (attack_prob > ctx->lcf->limit_threshold)
         ctx->rc = NGX_HTTP_TOO_MANY_REQUESTS;
     else
         ctx->rc = NGX_DECLINED;
@@ -727,7 +744,7 @@ done:
 }
 
 static void ngx_http_ml_ddos_worker_done(ngx_event_t *ev) {
-    ngx_http_ml_ddos_task_ctx_t *ctx = ev->data;
+    mlds_task_ctx_t *ctx = ev->data;
 
     if (ctx->rc == NGX_DECLINED)
         ctx->r->phase_handler++;
@@ -758,11 +775,6 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
         h->hash = 1;
     }
 #endif
-
-    ngx_thread_task_t *task =
-        ngx_thread_task_alloc(r->pool, sizeof(ngx_http_ml_ddos_task_ctx_t));
-    if (!task)
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
 
     ngx_slab_pool_t *shpool = (ngx_slab_pool_t *)mcf->shm_buffer->shm.addr;
     mlds_buffer_t *buffer = mcf->shm_buffer->data;
@@ -809,11 +821,15 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
                   features.data[6], features.data[7]);
 #endif
 
-    ngx_http_ml_ddos_task_ctx_t *ctx = task->ctx;
+    ngx_thread_task_t *task =
+        ngx_thread_task_alloc(r->pool, sizeof(mlds_task_ctx_t));
+    if (!task)
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+
+    mlds_task_ctx_t *ctx = task->ctx;
     ctx->mcf = mcf;
+    ctx->lcf = lcf;
     ctx->features_matrix = features_matrix;
-    ctx->block_threshold = lcf->block_threshold;
-    ctx->limit_threshold = lcf->limit_threshold;
     ctx->r = r;
 
     if (lcf->thread_pool) {
