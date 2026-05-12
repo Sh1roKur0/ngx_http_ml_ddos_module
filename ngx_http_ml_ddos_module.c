@@ -3,7 +3,6 @@
 #include <ngx_thread_pool.h>
 #include <onnxruntime_c_api.h>
 
-#include <ctype.h>
 #include <math.h>
 
 #define LOG_PREFIX "ML_DDOS: "
@@ -23,6 +22,7 @@
 
 typedef struct {
     ngx_str_t model_path;
+    ngx_shm_zone_t *shm_buffer;
     const OrtApi *ort_api;
     OrtEnv *ort_env;
     OrtSessionOptions *ort_session_options;
@@ -246,9 +246,193 @@ static void ngx_http_ml_ddos_exit_process(ngx_cycle_t *cycle) {
                   LOG_PREFIX "ONNX runtime shutdown");
 }
 
+/// ===== FEATURES ======
+
+#define NGX_HTTP_ML_DDOS_BUFFER_NAME "ML_DDOS_SHARED_BUFFER"
+#define NGX_HTTP_ML_DDOS_BUFFER_SIZE 1024
+#define NGX_HTTP_ML_DDOS_TABLE_SIZE (NGX_HTTP_ML_DDOS_BUFFER_SIZE * 4)
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(NGX_HTTP_ML_DDOS_BUFFER_SIZE <= 65535,
+               "Buffer size must not exceed uint16_t max capacity (65535)");
+
+#    define POWER_OF_2_CHECK(n)                               \
+        _Static_assert(((n) > 0) && (((n) & ((n) - 1))) == 0, \
+                       #n " size must be a power of two!")
+
+POWER_OF_2_CHECK(NGX_HTTP_ML_DDOS_BUFFER_SIZE);
+POWER_OF_2_CHECK(NGX_HTTP_ML_DDOS_TABLE_SIZE);
+#endif
+
+typedef struct ngx_http_ml_ddos_features_flags {
+    uint32_t http_version : 2;
+    uint32_t http_req_type : 2;
+    uint32_t has_user_agent : 2;
+    uint32_t has_ua_browser : 2;
+    uint32_t has_accept : 2;
+    uint32_t has_accept_language : 2;
+    uint32_t has_accept_encoding : 2;
+    uint32_t has_content_type : 2;
+    uint32_t has_cookies : 2;
+    uint32_t has_authorization : 2;
+    uint32_t has_referer : 2;
+    uint32_t has_host : 2;
+    uint32_t has_origin : 2;
+    uint32_t has_transfer_encoding : 2;
+    uint32_t keepalive : 2;
+    uint32_t quoted_uri : 2;
+} mlds_features_flags_t;
+
+typedef struct ngx_http_ml_ddos_features_params {
+    uint32_t ns_delta;         // delta between requests
+    uint32_t ip_request_count; // request count per user
+    uint32_t uri_length;
+    uint32_t args_length;
+    uint32_t header_count;
+    uint32_t content_length;
+    uint32_t connection_requests;
+    union {
+        mlds_features_flags_t flags;
+        uint32_t raw_flags;
+    };
+} mlds_features_params_t;
+
+typedef union ngx_http_ml_ddos_features {
+    mlds_features_params_t params;
+    uint32_t data[8];
+} mlds_features_t;
+
+typedef struct ngx_http_ml_ddos_metadata {
+    uint64_t timestamp;
+    uint32_t uid;
+} mlds_metadata_t;
+
+/**
+ * This buffer is located in shared memory across processes and holds data
+ * about time-series features of requests as synchronized static ring buffers.
+ * In addition, for O(1) user id counting in the buffer, we also allocate
+ * an direct-mapped hash table with MurmurHash3 algorithm for uint32_t.
+ *
+ * Buffers are split to minimize time spent holding the shared mutex:
+ * specifically, this allows for an efficient copy of the features buffer
+ * into an ONNX [BUFFER_SIZE, 8] matrix.
+ *
+ * goes this way ->            when reached the end, tail_idx is reset
+ * +----------------------+------------------------------------------+
+ * | features             |                                          |
+ * +----------------------+------------------------------------------+
+ * | meta                 |                                          |
+ * +----------------------+------------------------------------------+
+ * ^                      ^                                          ^
+ * buffers start       tail_idx                                BUFFER_SIZE
+ */
+typedef struct ngx_http_ml_ddos_buffer {
+    uint32_t tail_idx;
+    mlds_features_t features[NGX_HTTP_ML_DDOS_BUFFER_SIZE];
+    mlds_metadata_t meta[NGX_HTTP_ML_DDOS_BUFFER_SIZE];
+    uint16_t uid_table[NGX_HTTP_ML_DDOS_TABLE_SIZE];
+} mlds_buffer_t;
+
+static ngx_int_t mlds_init_shm(ngx_shm_zone_t *zone, void *data) {
+    if (data) {
+        zone->data = data;
+        return NGX_OK;
+    }
+
+    ngx_slab_pool_t *shpool = (ngx_slab_pool_t *)zone->shm.addr;
+    mlds_buffer_t *shm = ngx_slab_calloc(shpool, sizeof(*shm));
+    if (!shm)
+        return NGX_ERROR;
+
+    zone->data = shm;
+
+    return NGX_OK;
+}
+
+static ngx_inline ngx_shm_zone_t *mlds_create_shm(ngx_conf_t *cf,
+                                                  void *module) {
+    static ngx_str_t shm_name = ngx_string(NGX_HTTP_ML_DDOS_BUFFER_NAME);
+    ngx_shm_zone_t *shm_zone = ngx_shared_memory_add(
+        cf, &shm_name, 8192 + sizeof(mlds_buffer_t), module);
+    if (!shm_zone)
+        return NULL;
+
+    shm_zone->init = mlds_init_shm;
+
+    return shm_zone;
+}
+
+/// MurmurHash3 mixing constants to map a uint32_t to [0, TABLE_SIZE - 1]
+static ngx_inline uint32_t hash_uint32(uint32_t key) {
+    key ^= key >> 16;
+    key *= 0x85ebca6b;
+    key ^= key >> 13;
+    key *= 0xc2b2ae35;
+    key ^= key >> 16;
+    return key & (NGX_HTTP_ML_DDOS_TABLE_SIZE - 1);
+}
+
+static ngx_inline uint64_t shm_buffer_last_timestamp(mlds_buffer_t *buffer) {
+    return buffer->meta[buffer->tail_idx].timestamp;
+}
+
+static ngx_inline uint16_t shm_buffer_uid_count(mlds_buffer_t *buffer,
+                                                uint32_t uid) {
+    return buffer->uid_table[hash_uint32(uid)];
+}
+
+/// Pushes a new element into the sync ring buffers and updates the uid table
+static ngx_inline void shm_buffer_push_element(mlds_buffer_t *buffer,
+                                               mlds_features_t *features,
+                                               mlds_metadata_t *meta) {
+    buffer->tail_idx =
+        (buffer->tail_idx + 1) & (NGX_HTTP_ML_DDOS_BUFFER_SIZE - 1);
+
+    uint32_t old_hash = hash_uint32(buffer->meta[buffer->tail_idx].uid);
+    if (buffer->uid_table[old_hash] > 0)
+        buffer->uid_table[old_hash]--;
+
+    buffer->features[buffer->tail_idx] = *features;
+    buffer->meta[buffer->tail_idx] = *meta;
+
+    uint32_t new_hash = hash_uint32(meta->uid);
+    buffer->uid_table[new_hash]++;
+}
+
+/**
+ * Dumps the ring buffer into a contiguous buffer in linear chronological order
+ *
+ * +------------------------------+----------------------------------+
+ * |     Second: copy this        |       First: copy this           |
+ * |    (from start to tail)      |    (from tail + 1 to end)        |
+ * +------------------------------+----------------------------------+
+ * ^                              ^                                  ^
+ * features                    tail_idx                        BUFFER_SIZE
+ */
+mlds_features_t *shm_buffer_features_dump(mlds_buffer_t *buffer,
+                                          ngx_pool_t *pool) {
+    mlds_features_t *features =
+        ngx_palloc(pool, sizeof(*features) * NGX_HTTP_ML_DDOS_BUFFER_SIZE);
+    if (!features)
+        return NULL;
+
+    const size_t size = sizeof(mlds_features_t);
+    const size_t offset = NGX_HTTP_ML_DDOS_BUFFER_SIZE - 1 - buffer->tail_idx;
+
+    memcpy(features, &buffer->features[buffer->tail_idx + 1], offset * size);
+    memcpy(features + offset, buffer->features, (buffer->tail_idx + 1) * size);
+
+    return features;
+}
+
 /// ===== DIRECTIVES ======
 
 static ngx_int_t ngx_http_ml_ddos_init(ngx_conf_t *cf) {
+    ngx_http_ml_ddos_main_conf_t *mcf =
+        ngx_http_conf_get_module_main_conf(cf, ngx_http_ml_ddos_module);
+    if (!(mcf->shm_buffer = mlds_create_shm(cf, &ngx_http_ml_ddos_module)))
+        return NGX_ERROR;
+
     ngx_http_core_main_conf_t *cmcf =
         ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
     ngx_http_handler_pt *h =
@@ -271,8 +455,8 @@ static char *ngx_http_ml_ddos_path(ngx_conf_t *cf, ngx_command_t *cmd,
     return NGX_CONF_OK;
 }
 
-static inline ngx_str_t get_value(ngx_str_t *restrict value,
-                                  const ngx_str_t *prefix) {
+static ngx_inline ngx_str_t get_value(ngx_str_t *restrict value,
+                                      const ngx_str_t *prefix) {
     ngx_str_t result;
     result.len = value->len - prefix->len;
     result.data = value->data + prefix->len;
@@ -357,6 +541,124 @@ static char *ngx_http_ml_ddos_enable(ngx_conf_t *cf, ngx_command_t *cmd,
 
 /// ===== HANDLER =====
 
+static ngx_inline uint64_t get_current_nanos() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static ngx_inline uint32_t get_header_count(ngx_http_request_t *const r) {
+    uint32_t result = 0;
+
+    ngx_list_part_t *part = &r->headers_in.headers.part;
+    while (part) {
+        result += part->nelts;
+        part = part->next;
+    }
+
+    return result;
+}
+
+static ngx_inline ngx_uint_t get_http_version(ngx_uint_t version) {
+    switch (version) {
+    case NGX_HTTP_VERSION_11: return 1;
+    case NGX_HTTP_VERSION_20: return 2;
+#if (nginx_version >= 1025000)
+    case NGX_HTTP_VERSION_30: return 3;
+#endif
+    default: return 0;
+    }
+}
+
+static ngx_inline ngx_uint_t get_http_req_type(int type) {
+    switch (type) {
+    case NGX_HTTP_GET:
+    case NGX_HTTP_HEAD: return 1;
+    case NGX_HTTP_POST:
+    case NGX_HTTP_PUT:
+    case NGX_HTTP_DELETE: return 2;
+    case NGX_HTTP_CONNECT:
+    case NGX_HTTP_OPTIONS:
+    case NGX_HTTP_TRACE:
+    case NGX_HTTP_PATCH: return 3;
+    default: return 0;
+    }
+}
+
+static ngx_inline void parse_params(ngx_http_request_t *r,
+                                    mlds_features_params_t *params) {
+    ngx_http_headers_in_t *headers = &r->headers_in;
+    params->uri_length = r->uri.len;
+    params->args_length = r->args.len;
+    params->header_count = get_header_count(r);
+    params->content_length =
+        headers->content_length ? headers->content_length_n : 0;
+    params->connection_requests = r->connection->requests;
+}
+
+static ngx_inline void parse_flags(ngx_http_request_t *r,
+                                   mlds_features_flags_t *flags) {
+    ngx_http_headers_in_t *headers = &r->headers_in;
+
+    flags->http_version = get_http_version(r->http_version);
+    flags->http_req_type = get_http_req_type(r->method);
+
+    flags->has_user_agent = !!headers->user_agent;
+    flags->has_ua_browser = headers->msie || headers->msie6 || headers->opera ||
+                            headers->gecko || headers->chrome ||
+                            headers->safari || headers->konqueror;
+    flags->has_accept = !!headers->accept;
+    flags->has_accept_language = !!headers->accept_language;
+    flags->has_accept_encoding = !!headers->accept_encoding;
+    flags->has_content_type = !!headers->content_type;
+#if (nginx_version >= 1023000)
+    flags->has_cookies = !!headers->cookie;
+#else
+    flags->has_cookies = !!headers->cookies.nelts;
+#endif
+    flags->has_authorization = !!headers->authorization;
+    flags->has_referer = !!headers->referer;
+    flags->has_host = !!headers->host;
+    flags->has_transfer_encoding = !!headers->transfer_encoding;
+
+    flags->keepalive = r->keepalive;
+    flags->quoted_uri = r->quoted_uri;
+}
+
+static uint32_t get_client_ipv4_as_uint32(ngx_http_request_t *r) {
+    struct sockaddr *sockaddr = r->connection->sockaddr;
+    u_char *p;
+    uint32_t ipv4 = 0;
+
+    switch (sockaddr->sa_family) {
+    case AF_INET: {
+        struct sockaddr_in *sin = (struct sockaddr_in *)sockaddr;
+        ipv4 = ntohl(sin->sin_addr.s_addr);
+        break;
+    }
+    case AF_INET6: {
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sockaddr;
+
+        static const unsigned char ipv4_mapped_prefix[12] = {
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+
+        if (memcmp(sin6->sin6_addr.s6_addr, ipv4_mapped_prefix, 12) == 0) {
+            p = sin6->sin6_addr.s6_addr;
+            ipv4 = (p[12] << 24) | (p[13] << 16) | (p[14] << 8) | p[15];
+            ipv4 = ntohl(ipv4);
+        }
+        break;
+    }
+    }
+
+    return ipv4;
+}
+
+/// Caps the nanosecond delta at ~4.29 seconds to prevent overflow
+static ngx_inline uint32_t uint32_overflow_max(uint64_t a) {
+    return a > UINT32_MAX ? UINT32_MAX : (uint32_t)a;
+}
+
 typedef struct {
     ngx_http_ml_ddos_main_conf_t *mcf;
     float block_threshold;
@@ -371,93 +673,70 @@ static void ngx_http_ml_ddos_worker(void *data, ngx_log_t *log) {
     ngx_http_request_t *r = ctx->r;
     log = r->connection->log;
 
-    float intensity = (float)r->connection->requests;
-    float request_length = (float)r->request_length;
-    float url_length = (float)r->request_line.len;
-    float args_length = (float)r->args.len + !!r->args.len;
-    float ua_length = r->headers_in.user_agent
-                          ? (float)r->headers_in.user_agent->value.len
-                          : 0.0f;
+    ngx_slab_pool_t *shpool = (ngx_slab_pool_t *)mcf->shm_buffer->shm.addr;
+    mlds_buffer_t *buffer = mcf->shm_buffer->data;
 
-    ngx_time_t *tp = ngx_timeofday();
-    ngx_msec_t ms =
-        (tp->sec - r->start_sec) * 1000 + (tp->msec - r->start_msec);
-    float request_time = ms > 0 ? (float)ms / 1000.0f : 0.0f;
+    mlds_metadata_t meta;
+    meta.timestamp = get_current_nanos();
+    meta.uid = get_client_ipv4_as_uint32(r);
 
-    float special_chars = 0.0f;
-    for (size_t i = 0; i < r->args.len; i++)
-        if (!isalnum((unsigned char)r->args.data[i]))
-            special_chars++;
+    mlds_features_t features;
+    mlds_features_params_t *params = &features.params;
+    mlds_features_flags_t *flags = &params->flags;
+
+    parse_params(r, params);
+    parse_flags(r, flags);
+
+    ngx_shmtx_lock(&shpool->mutex);
+
+    params->ns_delta =
+        uint32_overflow_max(meta.timestamp - shm_buffer_last_timestamp(buffer));
+    params->ip_request_count = shm_buffer_uid_count(buffer, meta.uid);
+
+    shm_buffer_push_element(buffer, &features, &meta);
+    mlds_features_t *features_matrix =
+        shm_buffer_features_dump(buffer, r->pool);
+
+    ngx_shmtx_unlock(&shpool->mutex);
 
 #if NGX_DEBUG
     ngx_log_error(NGX_LOG_NOTICE, log, NGX_OK,
-                  LOG_PREFIX "PARAMS:\n"
-                             "\tintensivity:\t%f\n"
-                             "\trequest_length:\t%f\n"
-                             "\trequest_time:\t%.6f\n"
-                             "\turl_length:\t%f\n"
-                             "\targs_length:\t%f\n"
-                             "\tspecial_chars:\t%f\n"
-                             "\tua_length:\t%f",
-                  intensity, request_length, request_time, url_length,
-                  args_length, special_chars, ua_length);
+                  LOG_PREFIX "features:\n"
+                             "\tns_delta: %ul\n"
+                             "\tip_request_count: %ul\n"
+                             "\turi_length: %ul\n"
+                             "\targs_length: %ul\n"
+                             "\theader_count: %ul\n"
+                             "\tcontent_length: %ul\n"
+                             "\tconnection_requests: %ul\n"
+                             "\tflags: %ul",
+                  features.data[0], features.data[1], features.data[2],
+                  features.data[3], features.data[4], features.data[5],
+                  features.data[6], features.data[7]);
 #endif
-
-    float features[7];
-    features[0] = intensity;
-    features[1] = request_length;
-    features[2] = request_time;
-    features[3] = url_length;
-    features[4] = args_length;
-    features[5] = special_chars;
-    features[6] = ua_length;
 
     OrtStatus *status = NULL;
 #define ONNX_ASSERT(expr)  \
     if ((status = (expr))) \
         goto done;
 
-    int64_t dims[2] = {1, 7};
+    int64_t dims[3] = {1, NGX_HTTP_ML_DDOS_BUFFER_SIZE, 8};
     OrtValue *input_tensor = NULL;
     ONNX_ASSERT(mcf->ort_api->CreateTensorWithDataAsOrtValue(
-        mcf->ort_memory_info, features, sizeof(features), dims, 2,
-        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor));
+        mcf->ort_memory_info, features_matrix, sizeof(buffer->features), dims,
+        3, ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32, &input_tensor));
 
-    const char *input_names[] = {"features"};
-    const char *output_names[] = {"label", "probabilities"};
+    const char *input_names[] = {"input"};
+    const char *output_names[] = {"output"};
 
-    OrtValue *outputs[2] = {NULL, NULL};
+    OrtValue *outputs = NULL;
     ONNX_ASSERT(mcf->ort_api->Run(mcf->ort_session, NULL, input_names,
                                   (const OrtValue *const *)&input_tensor, 1,
-                                  output_names, 2, outputs));
-
-    ONNXType out_type;
-    ONNX_ASSERT(mcf->ort_api->GetValueType(outputs[1], &out_type));
-
-    if (out_type != ONNX_TYPE_SEQUENCE) {
-        ctx->rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
-        goto done;
-    }
-
-    size_t seq_len = 0;
-    ONNX_ASSERT(mcf->ort_api->GetValueCount(outputs[1], &seq_len));
-    if (seq_len == 0) {
-        ctx->rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
-        goto done;
-    }
-
-    OrtValue *seq_elem = NULL;
-    ONNX_ASSERT(
-        mcf->ort_api->GetValue(outputs[1], 0, mcf->ort_allocator, &seq_elem));
-
-    OrtValue *tensor = NULL;
-    ONNX_ASSERT(
-        mcf->ort_api->GetValue(seq_elem, 1, mcf->ort_allocator, &tensor));
+                                  output_names, 1, &outputs));
 
     float *probs = NULL;
-    ONNX_ASSERT(mcf->ort_api->GetTensorMutableData(tensor, (void **)&probs));
-
-    float attack_prob = probs[1];
+    ONNX_ASSERT(mcf->ort_api->GetTensorMutableData(outputs, (void **)&probs));
+    float attack_prob = probs[0];
 
 #if NGX_DEBUG
     ngx_log_error(NGX_LOG_NOTICE, log, NGX_OK,
@@ -479,16 +758,10 @@ done:
         ctx->rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    if (tensor)
-        mcf->ort_api->ReleaseValue(tensor);
-    if (seq_elem)
-        mcf->ort_api->ReleaseValue(seq_elem);
-    if (outputs[1])
-        mcf->ort_api->ReleaseValue(outputs[1]);
-    if (outputs[0])
-        mcf->ort_api->ReleaseValue(outputs[0]);
     if (input_tensor)
         mcf->ort_api->ReleaseValue(input_tensor);
+
+#undef ONNX_ASSERT
 }
 
 static void ngx_http_ml_ddos_worker_done(ngx_event_t *ev) {
