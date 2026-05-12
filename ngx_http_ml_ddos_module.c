@@ -23,6 +23,12 @@
 
 typedef struct {
     ngx_str_t model_path;
+    const OrtApi *ort_api;
+    OrtEnv *ort_env;
+    OrtSessionOptions *ort_session_options;
+    OrtSession *ort_session;
+    OrtAllocator *ort_allocator;
+    OrtMemoryInfo *ort_memory_info;
 } ngx_http_ml_ddos_main_conf_t;
 
 typedef struct {
@@ -31,13 +37,6 @@ typedef struct {
     float block_threshold;
     float limit_threshold;
 } ngx_http_ml_ddos_loc_conf_t;
-
-static const OrtApi *ort_api = NULL;
-static OrtEnv *ort_env = NULL;
-static OrtSessionOptions *ort_session_options = NULL;
-static OrtSession *ort_session = NULL;
-static OrtAllocator *ort_allocator = NULL;
-static OrtMemoryInfo *ort_memory_info = NULL;
 
 static void *ngx_http_ml_ddos_create_main_conf(ngx_conf_t *cf);
 static void *ngx_http_ml_ddos_create_loc_conf(ngx_conf_t *cf);
@@ -154,7 +153,7 @@ static ngx_int_t ngx_http_ml_ddos_init_process(ngx_cycle_t *cycle) {
         return NGX_ERROR;
     }
 
-    if (!(ort_api = OrtGetApiBase()->GetApi(ORT_API_VERSION))) {
+    if (!(mcf->ort_api = OrtGetApiBase()->GetApi(ORT_API_VERSION))) {
         ngx_log_error(NGX_LOG_ERR, cycle->log, NGX_ERROR,
                       LOG_PREFIX "failed to get ONNX API");
         return NGX_ERROR;
@@ -170,32 +169,38 @@ static ngx_int_t ngx_http_ml_ddos_init_process(ngx_cycle_t *cycle) {
 #else
 #    define ONNX_LOG_LEVEL ORT_LOGGING_LEVEL_ERROR
 #endif
-    ONNX_ASSERT(ort_api->CreateEnv(ONNX_LOG_LEVEL, "ngx_ml_ddos", &ort_env),
-                error_env);
-
-    ONNX_ASSERT(ort_api->CreateSessionOptions(&ort_session_options),
-                error_options);
-
-    ONNX_ASSERT(ort_api->SetIntraOpNumThreads(ort_session_options, 1),
-                error_options);
-    ONNX_ASSERT(ort_api->SetInterOpNumThreads(ort_session_options, 1),
-                error_options);
-
     ONNX_ASSERT(
-        ort_api->SetSessionExecutionMode(ort_session_options, ORT_SEQUENTIAL),
-        error_options);
+        mcf->ort_api->CreateEnv(ONNX_LOG_LEVEL, "ngx_ml_ddos", &mcf->ort_env),
+        error_env);
 
-    ONNX_ASSERT(ort_api->EnableMemPattern(ort_session_options), error_options);
-    ONNX_ASSERT(ort_api->EnableCpuMemArena(ort_session_options), error_options);
+    ONNX_ASSERT(mcf->ort_api->CreateSessionOptions(&mcf->ort_session_options),
+                error_options);
 
-    ONNX_ASSERT(ort_api->CreateSession(ort_env, (const char *)model_path_cstr,
-                                       ort_session_options, &ort_session),
+    ONNX_ASSERT(mcf->ort_api->SetIntraOpNumThreads(mcf->ort_session_options, 1),
+                error_options);
+    ONNX_ASSERT(mcf->ort_api->SetInterOpNumThreads(mcf->ort_session_options, 1),
+                error_options);
+
+    ONNX_ASSERT(mcf->ort_api->SetSessionExecutionMode(mcf->ort_session_options,
+                                                      ORT_SEQUENTIAL),
+                error_options);
+
+    ONNX_ASSERT(mcf->ort_api->EnableMemPattern(mcf->ort_session_options),
+                error_options);
+    ONNX_ASSERT(mcf->ort_api->EnableCpuMemArena(mcf->ort_session_options),
+                error_options);
+
+    ONNX_ASSERT(mcf->ort_api->CreateSession(
+                    mcf->ort_env, (const char *)model_path_cstr,
+                    mcf->ort_session_options, &mcf->ort_session),
                 error_session);
 
-    ONNX_ASSERT(ort_api->GetAllocatorWithDefaultOptions(&ort_allocator),
-                error_memory);
-    ONNX_ASSERT(ort_api->CreateCpuMemoryInfo(
-                    OrtArenaAllocator, OrtMemTypeDefault, &ort_memory_info),
+    ONNX_ASSERT(
+        mcf->ort_api->GetAllocatorWithDefaultOptions(&mcf->ort_allocator),
+        error_memory);
+    ONNX_ASSERT(mcf->ort_api->CreateCpuMemoryInfo(OrtArenaAllocator,
+                                                  OrtMemTypeDefault,
+                                                  &mcf->ort_memory_info),
                 error_memory);
 
     ngx_log_error(NGX_LOG_NOTICE, cycle->log, NGX_OK,
@@ -204,50 +209,38 @@ static ngx_int_t ngx_http_ml_ddos_init_process(ngx_cycle_t *cycle) {
     return NGX_OK;
 
 error_memory:
-    ort_api->ReleaseSession(ort_session);
+    mcf->ort_api->ReleaseSession(mcf->ort_session);
 error_session:
-    ort_api->ReleaseSessionOptions(ort_session_options);
+    mcf->ort_api->ReleaseSessionOptions(mcf->ort_session_options);
 error_options:
-    ort_api->ReleaseEnv(ort_env);
+    mcf->ort_api->ReleaseEnv(mcf->ort_env);
 error_env:
     ngx_log_error(NGX_LOG_ERR, cycle->log, NGX_ERROR,
                   LOG_PREFIX "ONNX initialize failed: %s",
-                  ort_api->GetErrorMessage(status));
-    ort_api->ReleaseStatus(status);
+                  mcf->ort_api->GetErrorMessage(status));
+    mcf->ort_api->ReleaseStatus(status);
     return NGX_ERROR;
 
 #undef ONNX_ASSERT
 }
 
 static void ngx_http_ml_ddos_exit_process(ngx_cycle_t *cycle) {
-    NGX_ASSERT(ort_session && ort_session_options && ort_env && ort_allocator &&
-                   ort_memory_info,
+    ngx_http_ml_ddos_main_conf_t *mcf =
+        ngx_http_cycle_get_module_main_conf(cycle, ngx_http_ml_ddos_module);
+    NGX_ASSERT(mcf->ort_session && mcf->ort_session_options && mcf->ort_env &&
+                   mcf->ort_allocator && mcf->ort_memory_info,
                cycle->log);
 
-    if (ort_allocator) {
-        ort_api->ReleaseAllocator(ort_allocator);
-        ort_allocator = NULL;
-    }
-
-    if (ort_memory_info) {
-        ort_api->ReleaseMemoryInfo(ort_memory_info);
-        ort_memory_info = NULL;
-    }
-
-    if (ort_session) {
-        ort_api->ReleaseSession(ort_session);
-        ort_session = NULL;
-    }
-
-    if (ort_session_options) {
-        ort_api->ReleaseSessionOptions(ort_session_options);
-        ort_session_options = NULL;
-    }
-
-    if (ort_env) {
-        ort_api->ReleaseEnv(ort_env);
-        ort_env = NULL;
-    }
+    if (mcf->ort_allocator)
+        mcf->ort_api->ReleaseAllocator(mcf->ort_allocator);
+    if (mcf->ort_memory_info)
+        mcf->ort_api->ReleaseMemoryInfo(mcf->ort_memory_info);
+    if (mcf->ort_session)
+        mcf->ort_api->ReleaseSession(mcf->ort_session);
+    if (mcf->ort_session_options)
+        mcf->ort_api->ReleaseSessionOptions(mcf->ort_session_options);
+    if (mcf->ort_env)
+        mcf->ort_api->ReleaseEnv(mcf->ort_env);
 
     ngx_log_error(NGX_LOG_NOTICE, cycle->log, NGX_OK,
                   LOG_PREFIX "ONNX runtime shutdown");
@@ -365,6 +358,7 @@ static char *ngx_http_ml_ddos_enable(ngx_conf_t *cf, ngx_command_t *cmd,
 /// ===== HANDLER =====
 
 typedef struct {
+    ngx_http_ml_ddos_main_conf_t *mcf;
     float block_threshold;
     float limit_threshold;
     ngx_http_request_t *r;
@@ -373,6 +367,7 @@ typedef struct {
 
 static void ngx_http_ml_ddos_worker(void *data, ngx_log_t *log) {
     ngx_http_ml_ddos_task_ctx_t *ctx = data;
+    ngx_http_ml_ddos_main_conf_t *mcf = ctx->mcf;
     ngx_http_request_t *r = ctx->r;
     log = r->connection->log;
 
@@ -424,20 +419,20 @@ static void ngx_http_ml_ddos_worker(void *data, ngx_log_t *log) {
 
     int64_t dims[2] = {1, 7};
     OrtValue *input_tensor = NULL;
-    ONNX_ASSERT(ort_api->CreateTensorWithDataAsOrtValue(
-        ort_memory_info, features, sizeof(features), dims, 2,
+    ONNX_ASSERT(mcf->ort_api->CreateTensorWithDataAsOrtValue(
+        mcf->ort_memory_info, features, sizeof(features), dims, 2,
         ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor));
 
     const char *input_names[] = {"features"};
     const char *output_names[] = {"label", "probabilities"};
 
     OrtValue *outputs[2] = {NULL, NULL};
-    ONNX_ASSERT(ort_api->Run(ort_session, NULL, input_names,
-                             (const OrtValue *const *)&input_tensor, 1,
-                             output_names, 2, outputs));
+    ONNX_ASSERT(mcf->ort_api->Run(mcf->ort_session, NULL, input_names,
+                                  (const OrtValue *const *)&input_tensor, 1,
+                                  output_names, 2, outputs));
 
     ONNXType out_type;
-    ONNX_ASSERT(ort_api->GetValueType(outputs[1], &out_type));
+    ONNX_ASSERT(mcf->ort_api->GetValueType(outputs[1], &out_type));
 
     if (out_type != ONNX_TYPE_SEQUENCE) {
         ctx->rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -445,20 +440,22 @@ static void ngx_http_ml_ddos_worker(void *data, ngx_log_t *log) {
     }
 
     size_t seq_len = 0;
-    ONNX_ASSERT(ort_api->GetValueCount(outputs[1], &seq_len));
+    ONNX_ASSERT(mcf->ort_api->GetValueCount(outputs[1], &seq_len));
     if (seq_len == 0) {
         ctx->rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
         goto done;
     }
 
     OrtValue *seq_elem = NULL;
-    ONNX_ASSERT(ort_api->GetValue(outputs[1], 0, ort_allocator, &seq_elem));
+    ONNX_ASSERT(
+        mcf->ort_api->GetValue(outputs[1], 0, mcf->ort_allocator, &seq_elem));
 
     OrtValue *tensor = NULL;
-    ONNX_ASSERT(ort_api->GetValue(seq_elem, 1, ort_allocator, &tensor));
+    ONNX_ASSERT(
+        mcf->ort_api->GetValue(seq_elem, 1, mcf->ort_allocator, &tensor));
 
     float *probs = NULL;
-    ONNX_ASSERT(ort_api->GetTensorMutableData(tensor, (void **)&probs));
+    ONNX_ASSERT(mcf->ort_api->GetTensorMutableData(tensor, (void **)&probs));
 
     float attack_prob = probs[1];
 
@@ -477,21 +474,21 @@ static void ngx_http_ml_ddos_worker(void *data, ngx_log_t *log) {
 done:
     if (status) {
         ngx_log_error(NGX_LOG_ERR, log, NGX_ERROR, LOG_PREFIX "ONNX error: %s",
-                      ort_api->GetErrorMessage(status));
-        ort_api->ReleaseStatus(status);
+                      mcf->ort_api->GetErrorMessage(status));
+        mcf->ort_api->ReleaseStatus(status);
         ctx->rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
     if (tensor)
-        ort_api->ReleaseValue(tensor);
+        mcf->ort_api->ReleaseValue(tensor);
     if (seq_elem)
-        ort_api->ReleaseValue(seq_elem);
+        mcf->ort_api->ReleaseValue(seq_elem);
     if (outputs[1])
-        ort_api->ReleaseValue(outputs[1]);
+        mcf->ort_api->ReleaseValue(outputs[1]);
     if (outputs[0])
-        ort_api->ReleaseValue(outputs[0]);
+        mcf->ort_api->ReleaseValue(outputs[0]);
     if (input_tensor)
-        ort_api->ReleaseValue(input_tensor);
+        mcf->ort_api->ReleaseValue(input_tensor);
 }
 
 static void ngx_http_ml_ddos_worker_done(ngx_event_t *ev) {
@@ -504,7 +501,10 @@ static void ngx_http_ml_ddos_worker_done(ngx_event_t *ev) {
 }
 
 static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
-    NGX_ASSERT(ort_api && ort_session, r->connection->log);
+    ngx_http_ml_ddos_main_conf_t *mcf =
+        ngx_http_get_module_main_conf(r, ngx_http_ml_ddos_module);
+
+    NGX_ASSERT(mcf->ort_api && mcf->ort_session, r->connection->log);
 
     ngx_http_ml_ddos_loc_conf_t *lcf =
         ngx_http_get_module_loc_conf(r, ngx_http_ml_ddos_module);
@@ -530,6 +530,7 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
 
     ngx_http_ml_ddos_task_ctx_t *ctx = task->ctx;
+    ctx->mcf = mcf;
     ctx->block_threshold = lcf->block_threshold;
     ctx->limit_threshold = lcf->limit_threshold;
     ctx->r = r;
