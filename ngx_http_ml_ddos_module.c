@@ -28,13 +28,12 @@ typedef struct {
     OrtEnv *ort_env;
     OrtSessionOptions *ort_session_options;
     OrtSession *ort_session;
-    OrtAllocator *ort_allocator;
     OrtMemoryInfo *ort_memory_info;
 } ngx_http_ml_ddos_main_conf_t;
 
 typedef struct {
     ngx_flag_t enabled;
-    ngx_flag_t opportunistic;
+    ngx_flag_t sampling;
     ngx_thread_pool_t *thread_pool;
     float block_threshold;
     float limit_threshold;
@@ -117,7 +116,7 @@ static char *ngx_http_ml_ddos_merge_loc_conf(ngx_conf_t *cf, void *parent,
     ngx_http_ml_ddos_loc_conf_t *conf = child;
 
     ngx_conf_merge_value(conf->enabled, prev->enabled, 0);
-    ngx_conf_merge_value(conf->opportunistic, prev->opportunistic, 0);
+    ngx_conf_merge_value(conf->sampling, prev->sampling, 0);
 
     if (conf->thread_pool == NULL)
         conf->thread_pool = prev->thread_pool;
@@ -221,9 +220,6 @@ static ngx_int_t ngx_http_ml_ddos_init_process(ngx_cycle_t *cycle) {
                     mcf->ort_session_options, &mcf->ort_session),
                 error_session);
 
-    ONNX_ASSERT(
-        mcf->ort_api->GetAllocatorWithDefaultOptions(&mcf->ort_allocator),
-        error_memory);
     ONNX_ASSERT(mcf->ort_api->CreateCpuMemoryInfo(OrtArenaAllocator,
                                                   OrtMemTypeDefault,
                                                   &mcf->ort_memory_info),
@@ -254,11 +250,9 @@ static void ngx_http_ml_ddos_exit_process(ngx_cycle_t *cycle) {
     ngx_http_ml_ddos_main_conf_t *mcf =
         ngx_http_cycle_get_module_main_conf(cycle, ngx_http_ml_ddos_module);
     NGX_ASSERT(mcf->ort_session && mcf->ort_session_options && mcf->ort_env &&
-                   mcf->ort_allocator && mcf->ort_memory_info,
+                   mcf->ort_memory_info,
                cycle->log);
 
-    if (mcf->ort_allocator)
-        mcf->ort_api->ReleaseAllocator(mcf->ort_allocator);
     if (mcf->ort_memory_info)
         mcf->ort_api->ReleaseMemoryInfo(mcf->ort_memory_info);
     if (mcf->ort_session)
@@ -278,15 +272,17 @@ static void ngx_http_ml_ddos_exit_process(ngx_cycle_t *cycle) {
 #define NGX_HTTP_ML_DDOS_BUFFER_SIZE 1024
 #define NGX_HTTP_ML_DDOS_TABLE_SIZE (NGX_HTTP_ML_DDOS_BUFFER_SIZE * 4)
 
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 _Static_assert(NGX_HTTP_ML_DDOS_BUFFER_SIZE <= 65535,
                "Buffer size must not exceed uint16_t max capacity (65535)");
 
-#define POWER_OF_2_CHECK(n)                               \
-    _Static_assert(((n) > 0) && (((n) & ((n) - 1))) == 0, \
-                   #n " size must be a power of two!")
+#    define POWER_OF_2_CHECK(n)                               \
+        _Static_assert(((n) > 0) && (((n) & ((n) - 1))) == 0, \
+                       #n " size must be a power of two!")
 
 POWER_OF_2_CHECK(NGX_HTTP_ML_DDOS_BUFFER_SIZE);
 POWER_OF_2_CHECK(NGX_HTTP_ML_DDOS_TABLE_SIZE);
+#endif
 
 #define NGX_HTTP_ML_DDOS_BUFFER_LIMIT(n, buffer) ((n) & (buffer - 1))
 
@@ -559,8 +555,8 @@ static char *ngx_http_ml_ddos_enable(ngx_conf_t *cf, ngx_command_t *cmd,
         return NGX_CONF_ERROR;
     }
 
-    static const ngx_str_t mode_str = ngx_string("mode=");
     static const ngx_str_t thread_str = ngx_string("thread=");
+    static const ngx_str_t mode_str = ngx_string("mode=");
     static const ngx_str_t block_str = ngx_string("block=");
     static const ngx_str_t limit_str = ngx_string("limit=");
 
@@ -571,7 +567,7 @@ static char *ngx_http_ml_ddos_enable(ngx_conf_t *cf, ngx_command_t *cmd,
                 return NGX_CONF_ERROR;
         } else if (ngx_strncmp(value[i].data, mode_str.data, mode_str.len) ==
                    0) {
-            if ((lcf->opportunistic = parse_mode(cf, &value[i], &mode_str)) ==
+            if ((lcf->sampling = parse_mode(cf, &value[i], &mode_str)) ==
                 NGX_CONF_UNSET)
                 return NGX_CONF_ERROR;
         } else if (ngx_strncmp(value[i].data, block_str.data, block_str.len) ==
@@ -805,8 +801,10 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
 
 #if NGX_DEBUG
     ngx_log_error(NGX_LOG_NOTICE, r->connection->log, NGX_OK,
-                  LOG_PREFIX "thread pool %p; block %.3f; limit %.3f",
-                  lcf->thread_pool, lcf->block_threshold, lcf->limit_threshold);
+                  LOG_PREFIX
+                  "thread pool %p; sampling: %d; block %.3f; limit %.3f",
+                  lcf->thread_pool, lcf->sampling, lcf->block_threshold,
+                  lcf->limit_threshold);
 
     ngx_table_elt_t *h = ngx_list_push(&r->headers_out.headers);
     if (h) {
@@ -830,8 +828,8 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
     parse_params(r, params);
     parse_flags(r, flags);
 
-    /// In opportunistic (sampling) mode try to lock, if failed, skip
-    if (lcf->opportunistic) {
+    /// In sampling mode try to lock, if failed, skip
+    if (lcf->sampling) {
         if (!ngx_shmtx_trylock(&shpool->mutex))
             return NGX_DECLINED;
     } else {
@@ -861,7 +859,7 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
                              "\theader_count: %ul\n"
                              "\tcontent_length: %ul\n"
                              "\tconnection_requests: %ul\n"
-                             "\tflags: %ul",
+                             "\tflags: %ul\n",
                   features.data[0], features.data[1], features.data[2],
                   features.data[3], features.data[4], features.data[5],
                   features.data[6], features.data[7]);
