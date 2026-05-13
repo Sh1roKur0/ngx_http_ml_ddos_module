@@ -1,3 +1,4 @@
+#include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
 #include <ngx_thread_pool.h>
@@ -33,6 +34,7 @@ typedef struct {
 
 typedef struct {
     ngx_flag_t enabled;
+    ngx_flag_t opportunistic;
     ngx_thread_pool_t *thread_pool;
     float block_threshold;
     float limit_threshold;
@@ -115,6 +117,7 @@ static char *ngx_http_ml_ddos_merge_loc_conf(ngx_conf_t *cf, void *parent,
     ngx_http_ml_ddos_loc_conf_t *conf = child;
 
     ngx_conf_merge_value(conf->enabled, prev->enabled, 0);
+    ngx_conf_merge_value(conf->opportunistic, prev->opportunistic, 0);
 
     if (conf->thread_pool == NULL)
         conf->thread_pool = prev->thread_pool;
@@ -336,6 +339,14 @@ typedef struct ngx_http_ml_ddos_metadata {
  * In addition, for O(1) user id counting in the buffer, we also allocate
  * an direct-mapped hash table with MurmurHash3 algorithm for uint32_t.
  *
+ * NOTE ON COLLISIONS:
+ * To maintain strictly non-blocking behaviour and avoid complex chaining or
+ * dynamic allocation in shared memory, we accept hash collisions in the
+ * uid_table. In the event of a collision, the IP request count may reflect and
+ * aggregate of multiple users. For DDoS detection, this "false positive"
+ * pressure is acceptable as it leans toward a conservative secrurity posture
+ * without sacrificing the throughput of the Nginx worker event loop.
+ *
  * Buffers are split to minimize time spent holding the shared mutex:
  * specifically, this allows for an efficient copy of the features buffer
  * into an ONNX [BUFFER_SIZE, 8] matrix.
@@ -497,6 +508,29 @@ static ngx_thread_pool_t *parse_thread_pool(ngx_conf_t *cf,
     return tpool;
 }
 
+static ngx_flag_t parse_mode(ngx_conf_t *cf, ngx_str_t *restrict param,
+                             const ngx_str_t *prefix) {
+    ngx_str_t value = get_value(param, prefix);
+
+    static const ngx_str_t sampling = ngx_string("sampling");
+    static const ngx_str_t strict = ngx_string("strict");
+
+    if (value.len == sampling.len &&
+        ngx_strncasecmp(value.data, sampling.data, sampling.len) == 0)
+        return 1;
+    else if (value.len == strict.len &&
+             ngx_strncasecmp(value.data, strict.data, strict.len) == 0)
+        return 0;
+
+    ngx_conf_log_error(
+        NGX_LOG_EMERG, cf, NGX_ERROR,
+        LOG_PREFIX
+        "invalid mode value \"%V\" (expected 'sampling' or 'strict')",
+        &value);
+
+    return NGX_CONF_UNSET;
+}
+
 static float parse_float(ngx_conf_t *cf, ngx_str_t *restrict param,
                          const ngx_str_t *prefix) {
     ngx_str_t value = get_value(param, prefix);
@@ -525,6 +559,7 @@ static char *ngx_http_ml_ddos_enable(ngx_conf_t *cf, ngx_command_t *cmd,
         return NGX_CONF_ERROR;
     }
 
+    static const ngx_str_t mode_str = ngx_string("mode=");
     static const ngx_str_t thread_str = ngx_string("thread=");
     static const ngx_str_t block_str = ngx_string("block=");
     static const ngx_str_t limit_str = ngx_string("limit=");
@@ -533,6 +568,11 @@ static char *ngx_http_ml_ddos_enable(ngx_conf_t *cf, ngx_command_t *cmd,
         if (ngx_strncmp(value[i].data, thread_str.data, thread_str.len) == 0) {
             lcf->thread_pool = parse_thread_pool(cf, &value[i], &thread_str);
             if (!lcf->thread_pool)
+                return NGX_CONF_ERROR;
+        } else if (ngx_strncmp(value[i].data, mode_str.data, mode_str.len) ==
+                   0) {
+            if ((lcf->opportunistic = parse_mode(cf, &value[i], &mode_str)) ==
+                NGX_CONF_UNSET)
                 return NGX_CONF_ERROR;
         } else if (ngx_strncmp(value[i].data, block_str.data, block_str.len) ==
                    0) {
@@ -790,7 +830,13 @@ static ngx_int_t ngx_http_ml_ddos_handler(ngx_http_request_t *r) {
     parse_params(r, params);
     parse_flags(r, flags);
 
-    ngx_shmtx_lock(&shpool->mutex);
+    /// In opportunistic (sampling) mode try to lock, if failed, skip
+    if (lcf->opportunistic) {
+        if (!ngx_shmtx_trylock(&shpool->mutex))
+            return NGX_DECLINED;
+    } else {
+        ngx_shmtx_lock(&shpool->mutex);
+    }
 
     params->ns_delta =
         uint32_overflow_max(meta.timestamp - shm_buffer_last_timestamp(buffer));

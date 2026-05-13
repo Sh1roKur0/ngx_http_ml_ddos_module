@@ -34,9 +34,15 @@ http {
             ml_ddos on thread=ml_ddos block=0.8 limit=0.6;
             proxy_pass http://backend_upstream;
         }
+
+        location /ml_async_sampling {
+            ml_ddos on thread=ml_ddos mode=sampling;
+            default_type text/plain;
+            return 200 "ML\n";
+        }
         
         location /ml_sync {
-            # Default options: without thread pool, block=0.85, limit=0.65
+            # Default options: without thread pool, mode=strict, block=0.85, limit=0.65
             ml_ddos on;
             proxy_pass http://backend_upstream;
         }
@@ -51,6 +57,8 @@ http {
 ```
 
 ### Benchmark
+TODO: outdated
+
 Using [wrk](https://github.com/wg/wrk) with the options `-t16 -c1000 -d10s`, we obtained the following results:
 
 |        |RPS        |Avg Latency|Latency Stdev|
