@@ -198,9 +198,9 @@ static ngx_int_t ngx_http_ml_ddos_init_process(ngx_cycle_t *cycle) {
     ONNX_ASSERT(mcf->ort_api->CreateSessionOptions(&mcf->ort_session_options),
                 error_options);
 
-    ONNX_ASSERT(mcf->ort_api->SetIntraOpNumThreads(mcf->ort_session_options, 1),
+    ONNX_ASSERT(mcf->ort_api->SetIntraOpNumThreads(mcf->ort_session_options, 0),
                 error_options);
-    ONNX_ASSERT(mcf->ort_api->SetInterOpNumThreads(mcf->ort_session_options, 1),
+    ONNX_ASSERT(mcf->ort_api->SetInterOpNumThreads(mcf->ort_session_options, 0),
                 error_options);
 
     ONNX_ASSERT(mcf->ort_api->SetSessionExecutionMode(mcf->ort_session_options,
