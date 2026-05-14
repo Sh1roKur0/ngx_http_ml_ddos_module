@@ -347,11 +347,11 @@ typedef struct ngx_http_ml_ddos_metadata {
 
 MLDS_STATIC_ASSERT(sizeof(mlds_features_flags_t) == sizeof(uint32_t),
                    "mlds_features_flags_t must be packed in uint32_t");
-MLDS_STATIC_ASSERT(sizeof(mlds_features_params_t) == sizeof(uint32_t) * 8,
-                   "mlds_features_params_t size must be exactly 8 of uint32_t");
 MLDS_STATIC_ASSERT(
-    sizeof(mlds_features_t) == sizeof(mlds_features_params_t),
-    "mlds_features_t size must be exact as mlds_features_params_t");
+    sizeof(mlds_features_params_t) == sizeof(uint32_t) * 8,
+    "mlds_features_params_t size must be exactly 8 * sizeof(uint32_t)");
+MLDS_STATIC_ASSERT(sizeof(mlds_features_t) == sizeof(mlds_features_params_t),
+                   "mlds_features_t size must match mlds_features_params_t");
 MLDS_STATIC_ASSERT(sizeof(mlds_metadata_t) == sizeof(uint64_t) * 2,
                    "mlds_metadata_t size must be exactly 2 of uint64_t");
 
