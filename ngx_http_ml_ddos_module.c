@@ -774,7 +774,8 @@ static void ngx_http_ml_ddos_worker(void *data, ngx_log_t *log) {
 #define NGX_HTTP_ML_DDOS_INPUT_DIM 2
 #define NGX_HTTP_ML_DDOS_OUTPUT_DIM 1
 
-    int64_t dims[2] = {NGX_HTTP_ML_DDOS_BUFFER_SIZE, 8};
+    int64_t dims[NGX_HTTP_ML_DDOS_INPUT_DIM] = {NGX_HTTP_ML_DDOS_BUFFER_SIZE,
+                                                8};
     OrtValue *input_tensor = NULL;
     ONNX_ASSERT(mcf->ort_api->CreateTensorWithDataAsOrtValue(
         mcf->ort_memory_info, ctx->features_matrix,
