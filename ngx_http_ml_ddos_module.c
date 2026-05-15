@@ -764,7 +764,8 @@ static void ngx_http_ml_ddos_worker(void *data, ngx_log_t *log) {
     mlds_task_ctx_t *ctx = data;
     ngx_http_ml_ddos_main_conf_t *mcf = ctx->mcf;
     ngx_http_request_t *r = ctx->r;
-    log = r->connection->log;
+    if (!ctx->lcf->thread_pool)
+        log = r->connection->log;
 
     OrtStatus *status = NULL;
 #define ONNX_ASSERT(expr)  \
