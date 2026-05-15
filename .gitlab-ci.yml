@@ -79,6 +79,11 @@ test:
                   return 200 "ML\n";
               }
 
+              location /ml_async_sampling {
+                  ml_ddos on thread=ml_ddos mode=sampling;
+                  default_type text/plain;
+                  return 200 "ML\n";
+              }
 
               location /ml_sync {
                   ml_ddos on;
@@ -104,14 +109,14 @@ test:
     - nginx -t 
     - nginx
 
-    - |
-      for i in $(seq 1 20); do
-        curl -s http://127.0.0.1:8080/default && break
-        sleep 1
-      done
+    - sleep 2
+    - cat /etc/nginx/logs/error.log
 
     - >
       curl -s -D - http://127.0.0.1:80/ml_async -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled" && echo "PASS: ml"
+
+    - >
+      curl -s -D - http://127.0.0.1:80/ml_async_sampling -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled" && echo "PASS: ml"
 
     - >
       curl -s -D - http://127.0.0.1:80/ml_sync -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled" && echo "PASS: ml"

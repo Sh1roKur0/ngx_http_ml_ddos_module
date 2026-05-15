@@ -22,7 +22,7 @@ load_module modules/ngx_http_ml_ddos_module.so;
 
 2. Configure the server:
 ``` nginx
-thread_pool ml_ddos threads=16 max_queue=65536;
+thread_pool ml_ddos threads=4 max_queue=65536;
 
 http {
     ml_ddos_path /etc/nginx/model.onnx;
@@ -34,9 +34,15 @@ http {
             ml_ddos on thread=ml_ddos block=0.8 limit=0.6;
             proxy_pass http://backend_upstream;
         }
+
+        location /ml_async_sampling {
+            ml_ddos on thread=ml_ddos mode=sampling;
+            default_type text/plain;
+            return 200 "ML\n";
+        }
         
         location /ml_sync {
-            # Default options: without thread pool, block=0.85, limit=0.65
+            # Default options: without thread pool, mode=strict, block=0.85, limit=0.65
             ml_ddos on;
             proxy_pass http://backend_upstream;
         }
@@ -51,9 +57,22 @@ http {
 ```
 
 ### Benchmark
-Using [wrk](https://github.com/wg/wrk) with the options `-t16 -c1000 -d10s`, we obtained the following results:
+The following benchmarks were conducted using [wrk](https://github.com/wg/wrk) with the parameters `-t16 -c1000 -d10s`on a local development environment.
 
-|        |RPS        |Avg Latency|Latency Stdev|
-|--------|-----------|-----------|-------------|
-|Enabled |56103.72   |44.60 ms   |150.68 ms    |
-|Disabled|68731.38   |33.41 ms   |132.33 ms    |
+Single Worker Performance (`worker_processes 1;`)
+
+|              |RPS     |Avg Latency|Latency Stdev|
+|--------------|--------|-----------|-------------|
+|Disabled      |67627.81|34.66 ms   |150.14 ms    |
+|Async         |56103.75|43.71 ms   |157.97 ms    |
+|Async sampling|35100.64|40.53 ms   |136.60 ms    |
+|Sync (strict) |30475.06|33.22 ms   |87.10 ms     |
+
+Multi-Worker Performance (`worker_processes auto;`)
+
+|              |RPS      |Avg Latency|Latency Stdev|
+|--------------|---------|-----------|-------------|
+|Disabled      |322997.38|3.20 ms    |2.31 ms      |
+|Async         |109816.13|9.03 ms    |3.42 ms      |
+|Async sampling|182356.31|5.62 ms    |3.65 ms      |
+|Sync (strict) |176545.12|5.64 ms    |2.55 ms      |
