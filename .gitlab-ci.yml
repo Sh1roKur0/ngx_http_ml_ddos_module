@@ -23,7 +23,7 @@ build:
         build-essential \
         libpcre2-dev \
         zlib1g-dev \
-        libssl3t64=3.5.5-1~deb13u1 \
+        libssl3t64 \
         libssl-dev \
         nginx \
         libonnxruntime-dev
@@ -113,16 +113,16 @@ test:
     - cat /etc/nginx/logs/error.log
 
     - >
-      curl -s -D - http://127.0.0.1:80/ml_async -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled" && echo "PASS: ml"
+      curl -s -D - http://127.0.0.1:8080/ml_async -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled" && echo "PASS: ml"
 
     - >
-      curl -s -D - http://127.0.0.1:80/ml_async_sampling -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled" && echo "PASS: ml"
+      curl -s -D - http://127.0.0.1:8080/ml_async_sampling -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled" && echo "PASS: ml"
 
     - >
-      curl -s -D - http://127.0.0.1:80/ml_sync -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled" && echo "PASS: ml"
+      curl -s -D - http://127.0.0.1:8080/ml_sync -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled" && echo "PASS: ml"
 
     - |
-      if curl -s -D - http://127.0.0.1:80/no_ml -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled"; then
+      if curl -s -D - http://127.0.0.1:8080/no_ml -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled"; then
         echo "FAIL: header should not exist"
         exit 1
       else
@@ -130,7 +130,7 @@ test:
       fi
 
     - |
-      if curl -s -D - http://127.0.0.1:80/default -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled"; then
+      if curl -s -D - http://127.0.0.1:8080/default -o /dev/null | grep -q "X-HTTP-ML-DDOS: Enabled"; then
         echo "FAIL: ml_ddos off by default"
         exit 1
       else
